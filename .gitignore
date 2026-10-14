@@ -1,0 +1,35 @@
+# --- Secrets and local configuration -------------------------------------
+.env
+secrets/
+*.session
+*.session-journal
+
+# Real chat list (must never be committed). The example file is not matched
+# by any rule and therefore stays tracked.
+config/chats.txt
+
+# --- Local data ----------------------------------------------------------
+*.db
+*.db-journal
+data/
+
+# --- Virtual environments ------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Build artifacts -----------------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Test / tooling caches -----------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+__pycache__/
+*.py[cod]

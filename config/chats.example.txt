@@ -1,0 +1,11 @@
+# Example chat list. Copy this file to "config/chats.txt" and add real IDs.
+#
+# One identifier per line. Blank lines and lines starting with "#" are ignored.
+# Real identifiers must NOT be committed; "config/chats.txt" is git-ignored.
+#
+# Prefer numeric IDs (for example -1001234567890) over usernames.
+#
+# Examples (placeholders, replace with real values):
+# -1001234567890
+# -1009876543210
+# @example_public_group
