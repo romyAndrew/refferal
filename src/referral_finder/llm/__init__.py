@@ -25,6 +25,15 @@ from .deepseek import (
     UrllibHttpTransport,
 )
 from .prompt import PROMPT_HASH, PROMPT_VERSION, build_messages
+from .service import (
+    STATUS_DISABLED,
+    STATUS_DUPLICATE,
+    STATUS_PREFILTER_SKIPPED,
+    STATUS_SAVED,
+    STATUS_STORAGE_ERROR,
+    AnalysisOutcome,
+    MessageAnalysisService,
+)
 from .schema import (
     STATUS_ERROR,
     STATUS_INVALID,
@@ -40,6 +49,7 @@ from .schema import (
 )
 
 __all__ = [
+    "AnalysisOutcome",
     "AnalysisResult",
     "DeepSeekProvider",
     "FakeProvider",
@@ -54,13 +64,19 @@ __all__ = [
     "LLMResponseError",
     "LLMServerError",
     "LLMTimeoutError",
+    "MessageAnalysisService",
     "PROMPT_HASH",
     "PROMPT_VERSION",
     "RELEVANT_CATEGORIES",
+    "STATUS_DISABLED",
+    "STATUS_DUPLICATE",
     "STATUS_ERROR",
     "STATUS_INVALID",
     "STATUS_OK",
+    "STATUS_PREFILTER_SKIPPED",
     "STATUS_REFUSED",
+    "STATUS_SAVED",
+    "STATUS_STORAGE_ERROR",
     "STATUSES",
     "UrllibHttpTransport",
     "ValidationError",
