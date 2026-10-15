@@ -24,10 +24,25 @@ except ImportError:  # pragma: no cover
 DEFAULT_DB_PATH = "data/messages.db"
 DEFAULT_CHATS_FILE = "config/chats.txt"
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_CLASSIFY_ON_INGEST = False
 
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
 TITLE_PREFIX = "title:"
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def _as_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ConfigError(f"Invalid boolean value: {value!r}")
 
 
 class ConfigError(Exception):
@@ -90,6 +105,7 @@ class Config:
     log_level: str
     chats_file: Path
     chats: Tuple[str, ...]
+    classify_on_ingest: bool = DEFAULT_CLASSIFY_ON_INGEST
 
     def safe_repr(self) -> str:
         """Representation that never exposes the API hash."""
@@ -101,7 +117,8 @@ class Config:
             f"db_path='{self.db_path}', "
             f"log_level='{self.log_level}', "
             f"chats_file='{self.chats_file}', "
-            f"chats={len(self.chats)} entries)"
+            f"chats={len(self.chats)} entries, "
+            f"classify_on_ingest={self.classify_on_ingest})"
         )
 
 
@@ -167,6 +184,9 @@ def load_config(
 
     db_path = Path(_get(env, "DB_PATH") or DEFAULT_DB_PATH).expanduser()
     log_level = (_get(env, "LOG_LEVEL") or DEFAULT_LOG_LEVEL).upper()
+    classify_on_ingest = _as_bool(
+        _get(env, "CLASSIFY_ON_INGEST"), DEFAULT_CLASSIFY_ON_INGEST
+    )
 
     if chats_file is not None:
         chats_path = Path(chats_file).expanduser()
@@ -183,4 +203,5 @@ def load_config(
         log_level=log_level,
         chats_file=chats_path,
         chats=chats,
+        classify_on_ingest=classify_on_ingest,
     )

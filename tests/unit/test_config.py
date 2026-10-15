@@ -55,6 +55,23 @@ def test_optional_defaults_and_overrides():
     assert config.log_level == "DEBUG"
 
 
+def test_classify_on_ingest_defaults_false(tmp_path):
+    config = load_config(make_env(), chats_file=tmp_path / "chats.txt")
+    assert config.classify_on_ingest is False
+
+
+def test_classify_on_ingest_truthy_and_falsy(tmp_path):
+    chats = tmp_path / "chats.txt"
+    assert load_config(make_env(CLASSIFY_ON_INGEST="true"), chats_file=chats).classify_on_ingest is True
+    assert load_config(make_env(CLASSIFY_ON_INGEST="ON"), chats_file=chats).classify_on_ingest is True
+    assert load_config(make_env(CLASSIFY_ON_INGEST="0"), chats_file=chats).classify_on_ingest is False
+
+
+def test_classify_on_ingest_invalid_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(make_env(CLASSIFY_ON_INGEST="maybe"), chats_file=tmp_path / "chats.txt")
+
+
 def test_safe_repr_hides_api_hash():
     config = load_config(make_env(TG_API_HASH="SUPERSECRET"))
     text = config.safe_repr()

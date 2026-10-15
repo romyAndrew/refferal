@@ -15,6 +15,7 @@ NEW_COLUMNS = (
     "sender_display_name",
     "message_url",
     "is_protected",
+    "sender_kind",
 )
 
 

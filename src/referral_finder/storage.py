@@ -19,10 +19,14 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
+from .classifier import CANDIDATE_CATEGORIES as _CANDIDATE_CATEGORIES
 from .models import IncomingMessage
 
 # A fetched row: (chat_id, message_id, date_utc, received_at_utc, text, sender_id).
 Row = Tuple[int, int, int, int, Optional[str], Optional[int]]
+
+# Smallest SQLite INTEGER, used as the initial keyset cursor for pagination.
+_INT64_MIN = -(2 ** 63)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -40,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_display_name TEXT,
     message_url         TEXT,
     is_protected        INTEGER,
+    sender_kind         TEXT,
     PRIMARY KEY (chat_id, message_id)
 )
 """
@@ -55,15 +60,16 @@ _MIGRATION_COLUMNS = (
     ("sender_display_name", "TEXT"),
     ("message_url", "TEXT"),
     ("is_protected", "INTEGER"),
+    ("sender_kind", "TEXT"),
 )
 
 _INSERT = """
 INSERT INTO messages (
     chat_id, message_id, date_utc, received_at_utc, text, sender_id,
     topic_id, topic_title, sender_username, sender_first_name, sender_last_name,
-    sender_display_name, message_url, is_protected
+    sender_display_name, message_url, is_protected, sender_kind
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(chat_id, message_id) DO NOTHING
 """
 
@@ -78,7 +84,8 @@ UPDATE messages SET
     sender_last_name    = COALESCE(sender_last_name, ?),
     sender_display_name = COALESCE(sender_display_name, ?),
     message_url         = COALESCE(message_url, ?),
-    is_protected        = COALESCE(is_protected, ?)
+    is_protected        = COALESCE(is_protected, ?),
+    sender_kind         = COALESCE(sender_kind, ?)
 WHERE chat_id = ? AND message_id = ?
 """
 
@@ -103,13 +110,84 @@ _METADATA_COLUMNS = (
     "sender_display_name",
     "message_url",
     "is_protected",
+    "sender_kind",
 )
 
 _SELECT_METADATA = """
 SELECT topic_id, topic_title, sender_username, sender_first_name,
-       sender_last_name, sender_display_name, message_url, is_protected
+       sender_last_name, sender_display_name, message_url, is_protected,
+       sender_kind
 FROM messages
 WHERE chat_id = ? AND message_id = ?
+"""
+
+# Classifier results live in their own table so the source message/text is never
+# duplicated or modified. One row per (message, classifier_version): a new
+# version is written alongside older ones, and re-processing a version is
+# idempotent.
+_CLASSIFICATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS message_classifications (
+    chat_id            INTEGER NOT NULL,
+    message_id         INTEGER NOT NULL,
+    classifier_version TEXT    NOT NULL,
+    category           TEXT    NOT NULL CHECK (category IN
+        ('referral_request','job_interest','referral_offer',
+         'recruitment_offer','irrelevant','uncertain')),
+    score              REAL    NOT NULL DEFAULT 0,
+    matched_rules      TEXT    NOT NULL DEFAULT '[]',
+    classified_at_utc  INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, classifier_version),
+    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+)
+"""
+
+_CLASSIFICATION_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_class_version_category "
+    "ON message_classifications(classifier_version, category)"
+)
+
+_INSERT_CLASSIFICATION = """
+INSERT INTO message_classifications (
+    chat_id, message_id, classifier_version, category, score,
+    matched_rules, classified_at_utc
+)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id, message_id, classifier_version) DO NOTHING
+"""
+
+_SELECT_UNCLASSIFIED = """
+SELECT m.chat_id, m.message_id, m.text
+FROM messages m
+LEFT JOIN message_classifications c
+    ON c.chat_id = m.chat_id
+   AND c.message_id = m.message_id
+   AND c.classifier_version = ?
+WHERE m.text IS NOT NULL
+  AND c.chat_id IS NULL
+  AND (m.chat_id, m.message_id) > (?, ?)
+ORDER BY m.chat_id, m.message_id
+LIMIT ?
+"""
+
+_COUNT_UNCLASSIFIED = """
+SELECT COUNT(*)
+FROM messages m
+LEFT JOIN message_classifications c
+    ON c.chat_id = m.chat_id
+   AND c.message_id = m.message_id
+   AND c.classifier_version = ?
+WHERE m.text IS NOT NULL AND c.chat_id IS NULL
+"""
+
+_SELECT_CANDIDATES = """
+SELECT m.chat_id, m.message_id, m.date_utc, m.sender_id, c.category, c.score
+FROM message_classifications c
+JOIN messages m
+    ON m.chat_id = c.chat_id AND m.message_id = c.message_id
+WHERE c.classifier_version = ?
+  AND c.category IN ({placeholders})
+ORDER BY m.date_utc, m.chat_id, m.message_id
+LIMIT ?
 """
 
 # Per-chat history reconciliation checkpoint. ``last_message_id`` is the newest
@@ -156,6 +234,8 @@ class MessageStore:
         # checkpoint table on existing databases too (no data loss).
         self._migrate_messages()
         self._conn.execute(_SYNC_SCHEMA)
+        self._conn.execute(_CLASSIFICATION_SCHEMA)
+        self._conn.execute(_CLASSIFICATION_INDEX)
         self._conn.commit()
 
     def _migrate_messages(self) -> None:
@@ -189,12 +269,13 @@ class MessageStore:
             message.sender_display_name,
             message.message_url,
             message.is_protected,
+            message.sender_kind,
         )
 
     @staticmethod
     def _metadata_values(row: tuple) -> tuple:
-        """The new metadata columns (indices 6..13) of an insert row."""
-        return row[6:14]
+        """The metadata columns (indices 6..14) of an insert row."""
+        return row[6:15]
 
     def save(self, message: IncomingMessage) -> bool:
         """Insert ``message``, returning ``True`` if a new row was written.
@@ -290,6 +371,85 @@ class MessageStore:
             (int(chat_id), int(last_message_id), int(updated_at_utc)),
         )
         self._conn.commit()
+
+    # --- classifier results ------------------------------------------------
+
+    def save_classifications(self, rows) -> int:
+        """Persist classifier results (idempotent per ``classifier_version``).
+
+        Each row is ``(chat_id, message_id, classifier_version, category, score,
+        matched_rules_json, classified_at_utc)``. Returns the number of new rows
+        written; existing (chat_id, message_id, version) rows are left as is.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        before = self._conn.total_changes
+        self._conn.executemany(_INSERT_CLASSIFICATION, rows)
+        self._conn.commit()
+        return int(self._conn.total_changes - before)
+
+    def get_classification(self, chat_id, message_id, version):
+        """Return a stored classification as a dict, or ``None``."""
+        row = self._conn.execute(
+            "SELECT category, score, matched_rules, classified_at_utc "
+            "FROM message_classifications "
+            "WHERE chat_id = ? AND message_id = ? AND classifier_version = ?",
+            (int(chat_id), int(message_id), version),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "category": row[0],
+            "score": float(row[1]),
+            "matched_rules": row[2],
+            "classified_at_utc": int(row[3]),
+        }
+
+    def count_unclassified(self, version) -> int:
+        """Number of text messages that have no result for ``version``."""
+        return int(
+            self._conn.execute(_COUNT_UNCLASSIFIED, (version,)).fetchone()[0]
+        )
+
+    def iter_unclassified(self, version, batch_size: int = 500):
+        """Yield batches of ``(chat_id, message_id, text)`` needing ``version``.
+
+        Keyset-paginated by ``(chat_id, message_id)`` so classification can be
+        committed per batch and resumed after interruption without re-reading
+        already-classified rows.
+        """
+        last_chat = _INT64_MIN
+        last_message = _INT64_MIN
+        while True:
+            rows = self._conn.execute(
+                _SELECT_UNCLASSIFIED,
+                (version, last_chat, last_message, int(batch_size)),
+            ).fetchall()
+            if not rows:
+                return
+            yield [(int(r[0]), int(r[1]), r[2]) for r in rows]
+            last_chat = int(rows[-1][0])
+            last_message = int(rows[-1][1])
+            if len(rows) < batch_size:
+                return
+
+    def iter_candidates(self, version, categories=None, limit=None):
+        """Yield candidate messages of ``version`` for the given categories.
+
+        Defaults to the candidate categories (``referral_request``,
+        ``job_interest``). Yields ``(chat_id, message_id, date_utc, sender_id,
+        category, score)``. The version is passed explicitly (no SQL view with a
+        dangling parameter).
+        """
+        cats = tuple(categories) if categories is not None else _CANDIDATE_CATEGORIES
+        if not cats:
+            return
+        placeholders = ",".join("?" for _ in cats)
+        sql = _SELECT_CANDIDATES.format(placeholders=placeholders)
+        params = [version, *cats, -1 if limit is None else int(limit)]
+        for row in self._conn.execute(sql, params):
+            yield (int(row[0]), int(row[1]), int(row[2]), row[3], row[4], float(row[5]))
 
     def close(self) -> None:
         """Close the connection. Safe to call more than once."""

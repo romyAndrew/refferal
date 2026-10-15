@@ -1,0 +1,42 @@
+[
+  {"group": "referral_request", "text": "Кто может скинуть реферальную ссылку на курьера?", "category": "referral_request"},
+  {"group": "referral_request", "text": "Дайте реф-код для регистрации, пожалуйста", "category": "referral_request"},
+  {"group": "referral_request", "text": "Как получить пригласительную ссылку?", "category": "referral_request"},
+  {"group": "referral_request", "text": "Рефералку дадите?", "category": "referral_request"},
+  {"group": "referral_request", "text": "need a referral code, can someone share?", "category": "referral_request"},
+  {"group": "referral_request", "text": "gde vzyat refku? podskazhite", "category": "referral_request"},
+
+  {"group": "referral_offer", "text": "Вот моя реферальная ссылка, регистрируйтесь", "category": "referral_offer"},
+  {"group": "referral_offer", "text": "Держи рефку, оформляйся", "category": "referral_offer"},
+  {"group": "referral_offer", "text": "Делюсь реф-кодом, кому нужно", "category": "referral_offer"},
+  {"group": "referral_offer", "text": "here is my referral link, join", "category": "referral_offer"},
+  {"group": "referral_offer", "text": "vot moya refka, polzuisya", "category": "referral_offer"},
+
+  {"group": "recruitment_offer", "text": "Набираю курьеров, оплата ежедневно, пишите", "category": "recruitment_offer"},
+  {"group": "recruitment_offer", "text": "Требуются пешие курьеры, вакансии рядом с домом", "category": "recruitment_offer"},
+  {"group": "recruitment_offer", "text": "Подключу к сервису доставки, оформление за 5 минут", "category": "recruitment_offer"},
+  {"group": "recruitment_offer", "text": "hiring couriers, weekly pay", "category": "recruitment_offer"},
+  {"group": "recruitment_offer", "text": "nabirayu kuryerov, oplata ezhednevno", "category": "recruitment_offer"},
+
+  {"group": "job_interest", "text": "Ищу работу курьером, куда обратиться?", "category": "job_interest"},
+  {"group": "job_interest", "text": "Сколько платят пешим курьерам?", "category": "job_interest"},
+  {"group": "job_interest", "text": "Какие условия работы в доставке?", "category": "job_interest"},
+  {"group": "job_interest", "text": "Хочу подрабатывать велокурьером по вечерам", "category": "job_interest"},
+  {"group": "job_interest", "text": "looking for a courier job in the city", "category": "job_interest"},
+  {"group": "job_interest", "text": "ishu rabotu kuryerom", "category": "job_interest"},
+
+  {"group": "irrelevant", "text": "Погода сегодня отличная, идём гулять", "category": "irrelevant"},
+  {"group": "irrelevant", "text": "Кто смотрел вчерашний матч?", "category": "irrelevant"},
+  {"group": "irrelevant", "text": "Спасибо, рефералка не нужна", "category": "irrelevant"},
+  {"group": "irrelevant", "text": "Работа курьером не интересна", "category": "irrelevant"},
+
+  {"group": "uncertain", "text": "курьер?", "category": "uncertain"},
+  {"group": "uncertain", "text": "реферальная ссылка", "category": "uncertain"},
+  {"group": "uncertain", "text": "скиньте ссылку", "category": "uncertain"},
+  {"group": "uncertain", "text": "а можно подработать?", "category": "uncertain"},
+  {"group": "uncertain", "text": "Ищу подработку в кафе по выходным", "category": "uncertain"},
+  {"group": "uncertain", "text": "Ищу работу курьером, дайте реферальную ссылку", "category": "uncertain"},
+
+  {"group": "typo_mixed_script", "text": "рeфералку дадите?", "category": "referral_request"},
+  {"group": "typo_mixed_script", "text": "нужна реферальная ссылка, кто даст?", "category": "referral_request"}
+]

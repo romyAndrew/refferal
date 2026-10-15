@@ -53,8 +53,16 @@ class MessageWriterError(RuntimeError):
 class MessageWriter:
     """Single background writer draining an :class:`asyncio.Queue` to SQLite."""
 
-    def __init__(self, store: MessageStore, maxsize: int = DEFAULT_QUEUE_MAX_SIZE):
+    def __init__(
+        self,
+        store: MessageStore,
+        maxsize: int = DEFAULT_QUEUE_MAX_SIZE,
+        on_saved=None,
+    ):
         self._store = store
+        # Optional post-persist callback (e.g. classification). It runs in this
+        # single writer task; failures are logged and never break ingestion.
+        self._on_saved = on_saved
         self._queue: "asyncio.Queue[object]" = asyncio.Queue(maxsize=maxsize)
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
@@ -232,6 +240,19 @@ class MessageWriter:
             finally:
                 self._queue.task_done()
 
+    def _notify_saved(self, messages) -> None:
+        """Run the optional post-persist hook; never let it break ingestion."""
+        if self._on_saved is None:
+            return
+        payload = [message for message in messages if getattr(message, "text", None)]
+        if not payload:
+            return
+        try:
+            self._on_saved(payload)
+        except Exception:
+            # Classification (or any post-persist step) must not stop collection.
+            logger.exception("Post-persist hook failed for %d message(s)", len(payload))
+
     def _persist_batch(self, messages) -> None:
         try:
             inserted, duplicates = self._store.save_many(messages)
@@ -241,6 +262,7 @@ class MessageWriter:
                 "Failed to store a batch of %d message(s)", len(messages)
             )
             return
+        self._notify_saved(messages)
         self.saved += inserted
         self.duplicates += duplicates
         logger.info(
@@ -263,6 +285,7 @@ class MessageWriter:
             )
             return
 
+        self._notify_saved((message,))
         if inserted:
             self.saved += 1
             logger.info(

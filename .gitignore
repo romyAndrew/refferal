@@ -11,7 +11,7 @@ config/chats.txt
 # --- Local data ----------------------------------------------------------
 *.db
 *.db-journal
-data/
+/data/
 
 # --- Virtual environments ------------------------------------------------
 .venv/

@@ -4,8 +4,9 @@ A local tool that (in later stages) will monitor selected Telegram chats via
 the official MTProto API (Telethon) and store new messages locally so they can
 be reviewed for courier-job interest.
 
-**Current status: stages 3–7 — SQLite storage, deduplication, pipeline
-robustness, bounded startup history reconciliation, and forum-topic support.**
+**Current status: stages 3–8 — SQLite storage, deduplication, pipeline
+robustness, bounded startup history reconciliation, forum-topic support, and a
+rule-based message classifier (offline backfill + optional online hook).**
 New incoming text messages are persisted to SQLite through a bounded queue with
 a single writer; repeated delivery of the same `(chat_id, message_id)` is
 ignored. Messages without text or a caption are skipped. On startup the client
@@ -40,8 +41,11 @@ src/referral_finder/
   ingest.py            bounded queue + single writer pipeline
   history.py           bounded startup history reconciliation
   topics.py            forum topic title resolution and caching
+  classifier.py        rule-based message classifier (pure)
+  classify.py          post-persist service + offline backfill CLI
   telegram_client.py   Telethon client, incoming handler, lifecycle
 tests/unit/        unit + integration tests (no Telegram, no network)
+tests/data/        synthetic classifier examples (no real messages)
 ```
 
 ### Message storage
@@ -110,6 +114,70 @@ gaps through the same single-writer pipeline. Deduplication by
 
 This is a one-shot startup scan, not a periodic poller, and it never downloads
 media.
+
+### Message classification
+
+A pure, deterministic rule-based classifier (`classifier.py`) labels each stored
+message into one of six categories:
+
+| Category | Meaning |
+|---|---|
+| `referral_request` | asks for a referral link/code |
+| `job_interest` | looking for a courier job / asking about conditions |
+| `referral_offer` | shares/gives a referral link or code |
+| `recruitment_offer` | recruits couriers / offers the job |
+| `irrelevant` | not related to the target task |
+| `uncertain` | not enough (or conflicting) evidence |
+
+`referral_offer` and `recruitment_offer` are distinct. When strong signals of
+different intents tie, the result is `uncertain` rather than a guess. `score` is
+a heuristic weight, **not** a calibrated probability.
+
+Results are stored in the separate `message_classifications` table (the `messages`
+table is never modified by classification). The primary key is
+`(chat_id, message_id, classifier_version)`, so re-processing a version is
+idempotent and a new rules version is stored alongside the old one. The active
+version is the explicit `CLASSIFIER_VERSION` constant (`classifier.py`), not a
+`MAX(version)` query. `matched_rules` stores rule ids as a JSON array; the
+message text is never copied into this table or into the logs.
+
+**Candidate queue:** `MessageStore.iter_candidates(version)` returns the active
+version's `referral_request` and `job_interest` messages; `referral_offer` /
+`recruitment_offer` are available separately (pass explicit `categories`).
+
+**Message classification vs author analytics (future stage).** Classification is
+per message. Grouping all messages of one person by the stable `sender_id`,
+keeping per-message historical usernames, and showing everything one author
+posted is a separate, later feature. This stage only prepares the basis: each
+message already stores `sender_id`, `sender_kind` (`user`/`channel`/`chat`/
+`anonymous`/`unknown`), and the username/name snapshot from processing time.
+Channel/anonymous senders are never treated as people.
+
+Online classification is **off by default**:
+
+| Variable | Required | Description |
+|---|---|---|
+| `CLASSIFY_ON_INGEST` | no | `true`/`1`/`on` to classify each successfully saved message (default `false`) |
+
+When enabled, classification runs as a post-persist hook inside the single
+writer; a classifier error is logged and does **not** stop collection. Backfill
+existing rows without Telegram:
+
+```
+.\.venv\Scripts\python -m referral_finder.classify --dry-run   # count only
+.\.venv\Scripts\python -m referral_finder.classify --limit 100 # trial run
+.\.venv\Scripts\python -m referral_finder.classify             # all pending
+```
+
+The backfill reads/writes in batches, is resumable, idempotent, uses
+`--db PATH` (default `DB_PATH`), and prints only counts/categories (never
+message text).
+
+Limitations: this is a transparent keyword/rule classifier (Russian, common
+English terms, transliteration). It does not understand arbitrary phrasing and
+its `score` is not calibrated. The synthetic examples under `tests/data/` are for
+functional and regression testing only; real precision/recall must be measured
+on a separate hand-labeled sample and is **not** claimed here.
 
 ## Setup (PowerShell)
 

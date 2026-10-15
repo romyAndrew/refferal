@@ -16,6 +16,7 @@ import logging
 import sys
 from typing import Optional, Sequence
 
+from .classify import ClassifierService
 from .config import Config, ConfigError, load_config
 from .ingest import MessageWriter
 from .logging_setup import setup_logging
@@ -27,7 +28,10 @@ async def _run(config: Config) -> None:
     # The database is created only here, i.e. only when the application actually
     # runs with a configured DB_PATH; importing the package never touches it.
     store = MessageStore(config.db_path)
-    writer = MessageWriter(store)
+    # Online classification is opt-in (CLASSIFY_ON_INGEST, default off) and runs
+    # as a post-persist hook in the single writer; it never blocks collection.
+    on_saved = ClassifierService(store).classify_saved if config.classify_on_ingest else None
+    writer = MessageWriter(store, on_saved=on_saved)
     # history_sync=True: reconcile missed messages on startup (bounded first
     # scan, then everything after the per-chat checkpoint).
     runner = TelegramRunner(config, writer=writer, store=store, history_sync=True)

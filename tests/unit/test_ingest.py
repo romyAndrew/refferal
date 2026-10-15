@@ -168,6 +168,75 @@ async def test_writer_persists_batch_and_counts_duplicates(tmp_path):
     store.close()
 
 
+async def test_writer_calls_on_saved_hook(tmp_path):
+    store = MessageStore(tmp_path / "messages.db")
+    seen = []
+    writer = MessageWriter(store, on_saved=seen.extend)
+    await writer.start()
+    try:
+        await writer.submit(make_message(message_id=1))
+        await writer.submit(make_message(message_id=2))
+        await writer.flush()
+    finally:
+        await writer.stop()
+
+    assert sorted(m.message_id for m in seen) == [1, 2]
+    store.close()
+
+
+async def test_batch_submit_calls_on_saved_hook(tmp_path):
+    store = MessageStore(tmp_path / "messages.db")
+    seen = []
+    writer = MessageWriter(store, on_saved=seen.extend)
+    await writer.start()
+    try:
+        await writer.submit_batch(
+            [make_message(message_id=1), make_message(message_id=2)]
+        )
+        await writer.flush()
+    finally:
+        await writer.stop()
+
+    assert sorted(m.message_id for m in seen) == [1, 2]
+    store.close()
+
+
+async def test_on_saved_hook_failure_does_not_break_ingestion(tmp_path, caplog):
+    store = MessageStore(tmp_path / "messages.db")
+
+    def boom(messages):
+        raise RuntimeError("classifier boom")
+
+    writer = MessageWriter(store, on_saved=boom)
+    await writer.start()
+    with caplog.at_level(logging.ERROR):
+        try:
+            await writer.submit(make_message(message_id=1))
+            await writer.submit(make_message(message_id=2))
+            await writer.flush()
+        finally:
+            await writer.stop()
+
+    assert store.count() == 2
+    assert writer.errors == 0
+    assert "Post-persist hook failed" in caplog.text
+    store.close()
+
+
+async def test_on_saved_hook_not_called_when_store_fails():
+    seen = []
+    writer = MessageWriter(BrokenStore(), on_saved=seen.extend)
+    await writer.start()
+    try:
+        await writer.submit(make_message(message_id=1))
+        await writer.flush()
+    finally:
+        await writer.stop()
+
+    assert writer.errors == 1
+    assert seen == []
+
+
 async def test_writer_stop_without_start_is_noop():
     writer = MessageWriter(BrokenStore())
     await writer.stop()

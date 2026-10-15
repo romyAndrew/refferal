@@ -44,6 +44,7 @@ class IncomingMessage:
     sender_display_name: Optional[str] = None
     message_url: Optional[str] = None
     is_protected: Optional[int] = None
+    sender_kind: Optional[str] = None
 
 
 def _sender_fields(obj) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -68,6 +69,28 @@ def _sender_fields(obj) -> tuple[Optional[str], Optional[str], Optional[str], Op
         first_name = None
         last_name = None
     return (username, first_name, last_name, display)
+
+
+def sender_kind(obj) -> Optional[str]:
+    """Classify the sender using real Telethon entity types (duck-typed).
+
+    Returns one of ``user``/``channel``/``chat``/``anonymous``/``unknown``.
+    Never inferred from username presence. ``anonymous`` is used for an
+    anonymous admin that exposes only ``post_author``; otherwise, when no sender
+    entity is available, the contract is ``unknown`` (not guessed).
+    """
+    sender = getattr(obj, "sender", None)
+    if sender is not None:
+        name = type(sender).__name__
+        if name == "User":
+            return "user"
+        if name == "Channel":
+            return "channel"
+        if name == "Chat":
+            return "chat"
+    if getattr(obj, "post_author", None):
+        return "anonymous"
+    return "unknown"
 
 
 def extract_topic_id(obj, chat_entity=None) -> Optional[int]:
@@ -177,6 +200,7 @@ def incoming_from_object(
 
     topic_id = extract_topic_id(obj, chat_entity)
     username, first_name, last_name, display_name = _sender_fields(obj)
+    kind = sender_kind(obj)
 
     return IncomingMessage(
         chat_id=int(obj.chat_id),
@@ -193,6 +217,7 @@ def incoming_from_object(
         sender_display_name=display_name,
         message_url=build_message_url(obj, chat_entity, topic_id),
         is_protected=compute_protected(obj, chat_entity),
+        sender_kind=kind,
     )
 
 

@@ -249,6 +249,56 @@ def test_message_without_flag_does_not_prove_chat_is_unprotected():
     assert incoming_from_object(msg, received_at_utc=1, chat_entity=entity).is_protected is None
 
 
+# --- sender kind ---------------------------------------------------------
+# Classes are named like the real Telethon types, because sender_kind() uses the
+# entity class name (entity type), not username presence.
+
+
+class User:
+    def __init__(self, username=None, first_name=None, last_name=None):
+        self.username = username
+        self.first_name = first_name
+        self.last_name = last_name
+
+
+class Channel:
+    def __init__(self, username=None, title="Channel"):
+        self.username = username
+        self.title = title
+
+
+class Chat:
+    def __init__(self, title="Chat"):
+        self.title = title
+
+
+def test_sender_kind_user():
+    message = incoming_from_object(FakeMessage(sender=User(first_name="Иван")), received_at_utc=1)
+    assert message.sender_kind == "user"
+
+
+def test_sender_kind_channel():
+    message = incoming_from_object(FakeMessage(sender=Channel(title="Новости")), received_at_utc=1)
+    assert message.sender_kind == "channel"
+
+
+def test_sender_kind_chat():
+    message = incoming_from_object(FakeMessage(sender=Chat()), received_at_utc=1)
+    assert message.sender_kind == "chat"
+
+
+def test_sender_kind_anonymous_from_post_author():
+    message = incoming_from_object(
+        FakeMessage(sender=None, post_author="Аноним"), received_at_utc=1
+    )
+    assert message.sender_kind == "anonymous"
+
+
+def test_sender_kind_unknown_without_entity():
+    message = incoming_from_object(FakeMessage(sender=None), received_at_utc=1)
+    assert message.sender_kind == "unknown"
+
+
 # --- resolver + consistency ---------------------------------------------
 
 
