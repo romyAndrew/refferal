@@ -167,16 +167,33 @@ offline tests only. Online calls stay off until explicitly enabled:
 
 | Variable | Required | Description |
 |---|---|---|
-| `LLM_ENABLED` | no | enable AI calls (default `false`; nothing calls out yet) |
+| `LLM_ENABLED` | no | master switch for real AI calls (default `false`) |
 | `LLM_PROVIDER` | no | provider key (default `deepseek`) |
 | `LLM_MODEL` | no | model id (default `deepseek-flash`) |
 | `LLM_BASE_URL` | no | API base URL (default `https://api.deepseek.com`) |
-| `LLM_API_KEY` | no | API key from the environment only; never logged |
+| `DEEPSEEK_API_KEY` | no | real key for DeepSeek, read **only** from the environment; never logged or committed |
 | `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | no | request timeout / bounded retries |
 | `LLM_MAX_INPUT_CHARS` / `LLM_MAX_OUTPUT_TOKENS` | no | input/output bounds |
 
 Scrubbing is best-effort and does **not** guarantee anonymization (names and
 other sensitive content may remain). See `SPEC.md` SEC-5.1–SEC-5.7.
+
+The analysis identity (stored in the `prompt_version` column) is the effective
+version: the prompt template version plus a hash of the normalized search
+criteria, so changing `--criteria` yields a distinct result instead of reusing
+an old one. A successful result is never re-requested; a temporary failure is
+retried a bounded number of times (`--max-attempts`, default 3).
+
+Offline pipeline check (FakeProvider, no network) and a single live smoke test:
+
+```
+.\.venv\Scripts\python -m referral_finder.llm.cli --db <test.db> [--dry-run] [--limit N]
+$env:LLM_ENABLED="true"; $env:DEEPSEEK_API_KEY="<key>"
+.\.venv\Scripts\python -m referral_finder.llm.smoke --live
+```
+
+The smoke test sends exactly one built-in synthetic message; it never runs from
+the test suite or at application start.
 
 When enabled, classification runs as a post-persist hook inside the single
 writer; a classifier error is logged and does **not** stop collection. Backfill
