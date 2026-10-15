@@ -99,3 +99,44 @@ def test_parse_chats_file_direct(tmp_path):
     chats_file.write_text("1\n2\n", encoding="utf-8")
     assert parse_chats_file(chats_file) == ("1", "2")
     assert parse_chats_file(tmp_path / "nope.txt") == ()
+
+
+def test_llm_defaults_are_off_but_configured(tmp_path):
+    config = load_config(make_env(), chats_file=tmp_path / "chats.txt")
+    assert config.llm_enabled is False
+    assert config.llm_provider == "deepseek"
+    assert config.llm_model == "deepseek-flash"
+    assert config.llm_api_key is None
+
+
+def test_llm_values_can_be_overridden(tmp_path):
+    config = load_config(
+        make_env(
+            LLM_ENABLED="true",
+            LLM_MODEL="deepseek-chat",
+            LLM_API_KEY="secret-key-value",
+            LLM_MAX_RETRIES="0",
+        ),
+        chats_file=tmp_path / "chats.txt",
+    )
+    assert config.llm_enabled is True
+    assert config.llm_model == "deepseek-chat"
+    assert config.llm_api_key == "secret-key-value"
+    assert config.llm_max_retries == 0
+
+
+def test_llm_invalid_numbers_raise(tmp_path):
+    chats = tmp_path / "chats.txt"
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_TIMEOUT="nope"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_MAX_RETRIES="-1"), chats_file=chats)
+
+
+def test_safe_repr_hides_llm_key(tmp_path):
+    config = load_config(
+        make_env(LLM_API_KEY="SUPERSECRETLLMKEY"), chats_file=tmp_path / "chats.txt"
+    )
+    text = config.safe_repr()
+    assert "SUPERSECRETLLMKEY" not in text
+    assert "llm_model='deepseek-flash'" in text

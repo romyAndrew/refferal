@@ -155,6 +155,52 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(chat_id, message_id, classifier_version) DO NOTHING
 """
 
+# AI (LLM) analysis results, stored separately from the source message. One row
+# per (message, provider, model, prompt_version): a new model/prompt revision is
+# written alongside older ones, and re-running a revision is idempotent. The
+# source `messages` table is never modified by this feature.
+_AI_SCHEMA = """
+CREATE TABLE IF NOT EXISTS message_ai_analysis (
+    chat_id            INTEGER NOT NULL,
+    message_id         INTEGER NOT NULL,
+    provider           TEXT    NOT NULL,
+    model              TEXT    NOT NULL,
+    prompt_version     TEXT    NOT NULL,
+    prompt_hash        TEXT    NOT NULL,
+    status             TEXT    NOT NULL,
+    relevant           INTEGER,
+    category           TEXT,
+    confidence         REAL,
+    explanation        TEXT,
+    error              TEXT,
+    analyzed_at_utc    INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, provider, model, prompt_version),
+    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+)
+"""
+
+_AI_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_ai_model_category "
+    "ON message_ai_analysis(provider, model, prompt_version, category)"
+)
+
+_INSERT_AI = """
+INSERT INTO message_ai_analysis (
+    chat_id, message_id, provider, model, prompt_version, prompt_hash,
+    status, relevant, category, confidence, explanation, error, analyzed_at_utc
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id, message_id, provider, model, prompt_version) DO NOTHING
+"""
+
+_SELECT_AI = """
+SELECT status, relevant, category, confidence, explanation, error,
+       prompt_hash, analyzed_at_utc
+FROM message_ai_analysis
+WHERE chat_id = ? AND message_id = ? AND provider = ? AND model = ?
+  AND prompt_version = ?
+"""
+
 _SELECT_UNCLASSIFIED = """
 SELECT m.chat_id, m.message_id, m.text
 FROM messages m
@@ -236,6 +282,8 @@ class MessageStore:
         self._conn.execute(_SYNC_SCHEMA)
         self._conn.execute(_CLASSIFICATION_SCHEMA)
         self._conn.execute(_CLASSIFICATION_INDEX)
+        self._conn.execute(_AI_SCHEMA)
+        self._conn.execute(_AI_INDEX)
         self._conn.commit()
 
     def _migrate_messages(self) -> None:
@@ -450,6 +498,53 @@ class MessageStore:
         params = [version, *cats, -1 if limit is None else int(limit)]
         for row in self._conn.execute(sql, params):
             yield (int(row[0]), int(row[1]), int(row[2]), row[3], row[4], float(row[5]))
+
+    # --- AI (LLM) analysis results ----------------------------------------
+
+    def save_ai_analysis(self, rows) -> int:
+        """Persist AI-analysis rows, idempotent per (message, model, prompt).
+
+        Each row is ``(chat_id, message_id, provider, model, prompt_version,
+        prompt_hash, status, relevant, category, confidence, explanation, error,
+        analyzed_at_utc)`` (see :func:`referral_finder.llm.schema.ai_analysis_row`).
+        Returns the number of new rows written; an existing
+        ``(chat_id, message_id, provider, model, prompt_version)`` row is left
+        unchanged.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        before = self._conn.total_changes
+        self._conn.executemany(_INSERT_AI, rows)
+        self._conn.commit()
+        return int(self._conn.total_changes - before)
+
+    def get_ai_analysis(
+        self, chat_id, message_id, provider, model, prompt_version
+    ) -> Optional[dict]:
+        """Return a stored AI-analysis dict, or ``None``."""
+        row = self._conn.execute(
+            _SELECT_AI,
+            (
+                int(chat_id),
+                int(message_id),
+                str(provider),
+                str(model),
+                str(prompt_version),
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": row[0],
+            "relevant": None if row[1] is None else bool(row[1]),
+            "category": row[2],
+            "confidence": None if row[3] is None else float(row[3]),
+            "explanation": row[4],
+            "error": row[5],
+            "prompt_hash": row[6],
+            "analyzed_at_utc": int(row[7]),
+        }
 
     def close(self) -> None:
         """Close the connection. Safe to call more than once."""

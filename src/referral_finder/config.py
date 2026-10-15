@@ -26,6 +26,17 @@ DEFAULT_CHATS_FILE = "config/chats.txt"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_CLASSIFY_ON_INGEST = False
 
+# LLM (DeepSeek) integration. Offline by default: online calls must be enabled
+# explicitly. The API key is read from the environment only and never logged.
+DEFAULT_LLM_ENABLED = False
+DEFAULT_LLM_PROVIDER = "deepseek"
+DEFAULT_LLM_MODEL = "deepseek-flash"
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+DEFAULT_LLM_TIMEOUT = 30.0
+DEFAULT_LLM_MAX_RETRIES = 2
+DEFAULT_LLM_MAX_INPUT_CHARS = 4000
+DEFAULT_LLM_MAX_OUTPUT_TOKENS = 400
+
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
 TITLE_PREFIX = "title:"
@@ -43,6 +54,24 @@ def _as_bool(value: Optional[str], default: bool = False) -> bool:
     if normalized in _FALSE_VALUES:
         return False
     raise ConfigError(f"Invalid boolean value: {value!r}")
+
+
+def _as_int(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Invalid integer value: {value!r}") from exc
+
+
+def _as_float(value: Optional[str], default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Invalid number value: {value!r}") from exc
 
 
 class ConfigError(Exception):
@@ -106,9 +135,19 @@ class Config:
     chats_file: Path
     chats: Tuple[str, ...]
     classify_on_ingest: bool = DEFAULT_CLASSIFY_ON_INGEST
+    llm_enabled: bool = DEFAULT_LLM_ENABLED
+    llm_provider: str = DEFAULT_LLM_PROVIDER
+    llm_model: str = DEFAULT_LLM_MODEL
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
+    llm_api_key: Optional[str] = None
+    llm_timeout: float = DEFAULT_LLM_TIMEOUT
+    llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
+    llm_max_input_chars: int = DEFAULT_LLM_MAX_INPUT_CHARS
+    llm_max_output_tokens: int = DEFAULT_LLM_MAX_OUTPUT_TOKENS
 
     def safe_repr(self) -> str:
-        """Representation that never exposes the API hash."""
+        """Representation that never exposes the API hash or the LLM key."""
+        key_state = "'***'" if self.llm_api_key else "None"
         return (
             "Config("
             f"api_id={self.api_id}, "
@@ -118,7 +157,11 @@ class Config:
             f"log_level='{self.log_level}', "
             f"chats_file='{self.chats_file}', "
             f"chats={len(self.chats)} entries, "
-            f"classify_on_ingest={self.classify_on_ingest})"
+            f"classify_on_ingest={self.classify_on_ingest}, "
+            f"llm_enabled={self.llm_enabled}, "
+            f"llm_provider='{self.llm_provider}', "
+            f"llm_model='{self.llm_model}', "
+            f"llm_api_key={key_state})"
         )
 
 
@@ -188,6 +231,24 @@ def load_config(
         _get(env, "CLASSIFY_ON_INGEST"), DEFAULT_CLASSIFY_ON_INGEST
     )
 
+    llm_enabled = _as_bool(_get(env, "LLM_ENABLED"), DEFAULT_LLM_ENABLED)
+    llm_timeout = _as_float(_get(env, "LLM_TIMEOUT"), DEFAULT_LLM_TIMEOUT)
+    if llm_timeout <= 0:
+        raise ConfigError("LLM_TIMEOUT must be positive")
+    llm_max_retries = _as_int(_get(env, "LLM_MAX_RETRIES"), DEFAULT_LLM_MAX_RETRIES)
+    if llm_max_retries < 0:
+        raise ConfigError("LLM_MAX_RETRIES must not be negative")
+    llm_max_input_chars = _as_int(
+        _get(env, "LLM_MAX_INPUT_CHARS"), DEFAULT_LLM_MAX_INPUT_CHARS
+    )
+    if llm_max_input_chars <= 0:
+        raise ConfigError("LLM_MAX_INPUT_CHARS must be positive")
+    llm_max_output_tokens = _as_int(
+        _get(env, "LLM_MAX_OUTPUT_TOKENS"), DEFAULT_LLM_MAX_OUTPUT_TOKENS
+    )
+    if llm_max_output_tokens <= 0:
+        raise ConfigError("LLM_MAX_OUTPUT_TOKENS must be positive")
+
     if chats_file is not None:
         chats_path = Path(chats_file).expanduser()
     else:
@@ -204,4 +265,13 @@ def load_config(
         chats_file=chats_path,
         chats=chats,
         classify_on_ingest=classify_on_ingest,
+        llm_enabled=llm_enabled,
+        llm_provider=(_get(env, "LLM_PROVIDER") or DEFAULT_LLM_PROVIDER),
+        llm_model=(_get(env, "LLM_MODEL") or DEFAULT_LLM_MODEL),
+        llm_base_url=(_get(env, "LLM_BASE_URL") or DEFAULT_LLM_BASE_URL),
+        llm_api_key=_get(env, "LLM_API_KEY"),
+        llm_timeout=llm_timeout,
+        llm_max_retries=llm_max_retries,
+        llm_max_input_chars=llm_max_input_chars,
+        llm_max_output_tokens=llm_max_output_tokens,
     )
