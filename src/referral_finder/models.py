@@ -1,8 +1,10 @@
 """Data transfer objects.
 
-Stage 1 defines the storage-ready shape of a message only. Nothing produces or
-persists these objects yet; that happens on later stages. These types carry no
-Telethon imports so they can be tested in isolation.
+Defines the storage-ready shape of a message, decoupled from Telethon: the
+conversion from a Telethon event to :class:`IncomingMessage` happens in
+:mod:`referral_finder.telegram_client`, and mapping the DTO onto SQL rows
+happens in :mod:`referral_finder.storage`. These types carry no Telethon imports
+so they can be tested in isolation.
 """
 
 from __future__ import annotations

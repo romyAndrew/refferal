@@ -4,23 +4,28 @@ No Telegram/network access happens at import time; a connection is only opened
 when :meth:`TelegramRunner.start` / :meth:`TelegramRunner.run_forever` is
 explicitly awaited.
 
-Stage 2 does not persist messages. The handler emits a minimal technical log
-record (chat id, message id, timestamp, text length) and deliberately keeps the
-message text out of the logs. No media is downloaded and no extra profile data
-is requested.
+The handler emits a minimal technical log record (chat id, message id,
+timestamp, text length) and deliberately keeps the message text out of the logs.
+When a :class:`~referral_finder.ingest.MessageWriter` is attached, text-bearing
+messages are also forwarded to it for persistence; messages without text or a
+caption are skipped. No media is downloaded and no extra profile data is
+requested.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Awaitable, Callable, Iterable, Optional, Tuple
 
 from telethon import TelegramClient, events
 
 from .config import Config, ConfigError
+from .ingest import MessageWriter, MessageWriterError
 from .models import IncomingMessage
+from .storage import MessageStore
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +108,13 @@ def to_log_record(message: IncomingMessage) -> MessageLogRecord:
     )
 
 
-async def handle_new_message(event) -> None:
+async def handle_new_message(event, writer: Optional[MessageWriter] = None) -> None:
     """Handle a new incoming message.
 
-    Logs a minimal technical record and never the message text. Extraction
-    failures are logged explicitly so they are not silently swallowed.
+    Logs a minimal technical record and never the message text. Messages without
+    text or a caption are skipped (per SPEC FR-11). When ``writer`` is provided,
+    text-bearing messages are queued for persistence. Extraction failures are
+    logged explicitly so they are not silently swallowed.
     """
     try:
         message = extract_message(event)
@@ -124,29 +131,96 @@ async def handle_new_message(event) -> None:
         record.text_length,
     )
 
+    if message.text is None:
+        logger.debug(
+            "Skipping message without text chat_id=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
+        return
 
-class TelegramRunner:
-    """Owns a :class:`TelegramClient` and the application lifecycle.
+    if writer is None:
+        return
 
-    The client is injectable so lifecycle ordering and shutdown can be tested
-    without any network access.
+    # Backpressure: awaits if the bounded queue is full instead of dropping.
+    try:
+        await writer.submit(message)
+    except MessageWriterError:
+        # The writer has failed or stopped; the message cannot be persisted.
+        # Log it explicitly (identifiers only) so the loss is not silent.
+        logger.exception(
+            "Message writer unavailable; message not persisted "
+            "chat_id=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
+    except asyncio.CancelledError:
+        # Telethon cancels in-flight handler tasks on disconnect. The message
+        # was not queued; log it (identifiers only) and propagate cancellation.
+        logger.warning(
+            "Message handling cancelled during shutdown; message not persisted "
+            "chat_id=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
+        raise
+
+
+def make_message_handler(
+    writer: Optional[MessageWriter],
+) -> Callable[[object], Awaitable[None]]:
+    """Bind ``writer`` to :func:`handle_new_message` for Telethon registration.
+
+    Telethon calls handlers with a single ``event`` argument, so the writer is
+    captured in a closure rather than passed by the framework.
     """
 
-    def __init__(self, config: Config, client: Optional[TelegramClient] = None):
+    async def handler(event) -> None:
+        await handle_new_message(event, writer=writer)
+
+    return handler
+
+
+class TelegramRunner:
+    """Owns a :class:`TelegramClient`, the message writer, and the lifecycle.
+
+    The client, writer, and store are injectable so lifecycle ordering and
+    shutdown can be tested without any network access. When a ``writer`` is
+    supplied the inbound handler forwards text messages to it; otherwise the
+    handler only logs.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        client: Optional[TelegramClient] = None,
+        writer: Optional[MessageWriter] = None,
+        store: Optional[MessageStore] = None,
+    ):
         self._config = config
         self._client = client if client is not None else create_client(config)
+        self._writer = writer
+        self._store = store
         self._registered = False
 
     @property
     def client(self) -> TelegramClient:
         return self._client
 
-    def register(self, handler=handle_new_message) -> None:
+    @property
+    def writer(self) -> Optional[MessageWriter]:
+        return self._writer
+
+    def register(self, handler=None) -> None:
         """Register the inbound-message handler.
 
         Must happen before :meth:`start` (and therefore before ``catch_up``) so
-        that recovered updates are processed by our handler.
+        that recovered updates are processed by our handler. When no explicit
+        ``handler`` is passed and a writer is attached, the handler is bound to
+        that writer.
         """
+        if handler is None:
+            handler = make_message_handler(self._writer)
         chat_ids = parse_chat_ids(self._config.chats)
         builder = new_message_builder(chat_ids)
         self._client.add_event_handler(handler, builder)
@@ -156,7 +230,9 @@ class TelegramRunner:
         )
 
     async def start(self) -> None:
-        """Connect, authorize if needed, and catch up on missed updates."""
+        """Start the writer, connect, authorize if needed, and catch up."""
+        if self._writer is not None:
+            await self._writer.start()
         if not self._registered:
             self.register()
         await self._client.start()
@@ -171,10 +247,45 @@ class TelegramRunner:
         await self._client.run_until_disconnected()
 
     async def shutdown(self) -> None:
-        """Disconnect the client if it is still connected."""
+        """Stop the pipeline and release resources, in a safe order.
+
+        Order matters, and is driven by how Telethon actually behaves:
+
+        1. **Disconnect the client first.** This stops Telegram update delivery
+           (``_update_loop`` runs only while connected) and Telethon cancels and
+           awaits any in-flight event-handler tasks. After this returns, no new
+           call to :meth:`MessageWriter.submit` can happen.
+        2. **Stop the writer.** Everything already accepted into the queue is
+           drained and persisted before the writer task ends.
+        3. **Close the SQLite store last**, only once the writer has finished.
+
+        Each step is isolated, and a pending cancellation is remembered and
+        re-raised at the end, so one failing component does not skip the others.
+        """
+        cancellation: Optional[BaseException] = None
+
         try:
             if self._client.is_connected():
                 await self._client.disconnect()
                 logger.info("Telegram client disconnected.")
+        except asyncio.CancelledError as exc:  # remember, keep cleaning up
+            cancellation = cancellation or exc
         except Exception:
-            logger.exception("Error while shutting down the Telegram client.")
+            logger.exception("Error while disconnecting the Telegram client.")
+
+        if self._writer is not None:
+            try:
+                await self._writer.stop()
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except Exception:
+                logger.exception("Error while stopping the message writer.")
+
+        if self._store is not None:
+            try:
+                self._store.close()
+            except Exception:
+                logger.exception("Error while closing the message store.")
+
+        if cancellation is not None:
+            raise cancellation

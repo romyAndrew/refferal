@@ -17,12 +17,18 @@ import sys
 from typing import Optional, Sequence
 
 from .config import Config, ConfigError, load_config
+from .ingest import MessageWriter
 from .logging_setup import setup_logging
+from .storage import MessageStore
 from .telegram_client import TelegramRunner
 
 
 async def _run(config: Config) -> None:
-    runner = TelegramRunner(config)
+    # The database is created only here, i.e. only when the application actually
+    # runs with a configured DB_PATH; importing the package never touches it.
+    store = MessageStore(config.db_path)
+    writer = MessageWriter(store)
+    runner = TelegramRunner(config, writer=writer, store=store)
     try:
         await runner.run_forever()
     finally:

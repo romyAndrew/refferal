@@ -21,8 +21,10 @@ def make_env(**overrides: str) -> dict:
     return env
 
 
-def test_load_config_valid_values():
-    config = load_config(make_env())
+def test_load_config_valid_values(tmp_path):
+    # Pass an explicit (non-existent) chats file so the test never reads the
+    # developer's real config/chats.txt.
+    config = load_config(make_env(), chats_file=tmp_path / "chats.txt")
     assert config.api_id == 123456
     assert config.api_hash == "fake_api_hash_value"
     assert config.session_path == Path("C:/secrets/referral.session")
