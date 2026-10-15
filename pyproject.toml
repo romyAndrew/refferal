@@ -31,6 +31,7 @@ where = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-m 'not live'"
+filterwarnings = ["error::ResourceWarning"]
 markers = [
     "live: tests that require a real Telegram connection (excluded by default)",
 ]
