@@ -201,6 +201,34 @@ WHERE chat_id = ? AND message_id = ? AND provider = ? AND model = ?
   AND prompt_version = ?
 """
 
+_SELECT_AI_UNPROCESSED = """
+SELECT m.chat_id, m.message_id, m.text
+FROM messages m
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+WHERE m.text IS NOT NULL
+  AND a.chat_id IS NULL
+  AND (m.chat_id, m.message_id) > (?, ?)
+ORDER BY m.chat_id, m.message_id
+LIMIT ?
+"""
+
+_COUNT_AI_UNPROCESSED = """
+SELECT COUNT(*)
+FROM messages m
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+WHERE m.text IS NOT NULL AND a.chat_id IS NULL
+"""
+
 _SELECT_UNCLASSIFIED = """
 SELECT m.chat_id, m.message_id, m.text
 FROM messages m
@@ -545,6 +573,44 @@ class MessageStore:
             "prompt_hash": row[6],
             "analyzed_at_utc": int(row[7]),
         }
+
+    def count_ai_unprocessed(self, provider, model, prompt_version) -> int:
+        """Number of text messages with no AI result for (provider, model, prompt)."""
+        return int(
+            self._conn.execute(
+                _COUNT_AI_UNPROCESSED,
+                (str(provider), str(model), str(prompt_version)),
+            ).fetchone()[0]
+        )
+
+    def iter_ai_unprocessed(self, provider, model, prompt_version, batch_size: int = 500):
+        """Yield batches of ``(chat_id, message_id, text)`` needing AI analysis.
+
+        Keyset-paginated by ``(chat_id, message_id)`` for the given
+        (provider, model, prompt_version) so a run can be resumed without
+        re-reading already-analysed rows.
+        """
+        last_chat = _INT64_MIN
+        last_message = _INT64_MIN
+        while True:
+            rows = self._conn.execute(
+                _SELECT_AI_UNPROCESSED,
+                (
+                    str(provider),
+                    str(model),
+                    str(prompt_version),
+                    last_chat,
+                    last_message,
+                    int(batch_size),
+                ),
+            ).fetchall()
+            if not rows:
+                return
+            yield [(int(r[0]), int(r[1]), r[2]) for r in rows]
+            last_chat = int(rows[-1][0])
+            last_message = int(rows[-1][1])
+            if len(rows) < batch_size:
+                return
 
     def close(self) -> None:
         """Close the connection. Safe to call more than once."""
