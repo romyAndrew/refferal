@@ -28,6 +28,7 @@ from .service import (
     STATUS_STORAGE_ERROR,
     MessageAnalysisService,
 )
+from .versioning import effective_analysis_version
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -76,9 +77,10 @@ async def _run_pipeline(store, provider, enabled, criteria, limit) -> dict:
     service = MessageAnalysisService(
         store, provider, enabled=enabled, criteria=criteria
     )
+    version = effective_analysis_version(provider.prompt_version, criteria)
     counts = _empty_counts()
     for batch in store.iter_ai_unprocessed(
-        provider.provider_name, provider.model, provider.prompt_version
+        provider.provider_name, provider.model, version
     ):
         for chat_id, message_id, text in batch:
             if limit is not None and counts["checked"] >= limit:
@@ -128,11 +130,12 @@ def run(
     store = MessageStore(Path(args.db).expanduser())
     try:
         if args.dry_run:
+            version = effective_analysis_version(provider.prompt_version, args.criteria)
             pending = store.count_ai_unprocessed(
-                provider.provider_name, provider.model, provider.prompt_version
+                provider.provider_name, provider.model, version
             )
             print(
-                f"dry_run=1 pending={pending} version={provider.prompt_version}"
+                f"dry_run=1 pending={pending} version={version}"
             )
             return 0
 

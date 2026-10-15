@@ -16,9 +16,15 @@ from referral_finder.llm import (
     MessageAnalysisService,
 )
 from referral_finder.llm.deepseek import DeepSeekProvider, HttpResponse
+from referral_finder.llm.versioning import effective_analysis_version
 from referral_finder.models import IncomingMessage
 from referral_finder.scrubbing import scrub
 from referral_finder.storage import MessageStore
+
+
+def eff(provider, criteria: str = "") -> str:
+    return effective_analysis_version(provider.prompt_version, criteria)
+
 
 CHAT = -1001234567890
 MATCHING = "Ищу работу курьером, пишите @ivan_petrov или ivan@test.ru, https://t.me/ivan/5"
@@ -61,7 +67,7 @@ async def test_message_not_passing_prefilter_never_calls_provider(tmp_path):
 
         assert outcome.status == STATUS_PREFILTER_SKIPPED
         assert provider.calls == []
-        assert store.get_ai_analysis(CHAT, 1, "fake", "fake-model", provider.prompt_version) is None
+        assert store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider)) is None
 
 
 async def test_provider_receives_scrubbed_text_only(tmp_path):
@@ -93,7 +99,7 @@ async def test_valid_result_is_stored_separately_from_messages(tmp_path):
 
         assert outcome.status == STATUS_SAVED
         assert store.fetch(CHAT, 1)[4] == MATCHING  # source row untouched
-        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", provider.prompt_version)
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider))
         assert stored["category"] == JOB_INTEREST
         assert stored["relevant"] is True
 
@@ -123,7 +129,7 @@ async def test_uncertain_is_stored_as_uncertain_not_irrelevant(tmp_path):
 
         await service.analyze(CHAT, 1, MATCHING)
 
-        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", provider.prompt_version)
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider))
         assert stored["category"] == UNCERTAIN
         assert stored["category"] != IRRELEVANT
         assert stored["relevant"] is None
@@ -168,7 +174,7 @@ async def test_provider_response_error_is_stored_as_invalid(tmp_path):
         outcome = await service.analyze(CHAT, 1, MATCHING)
 
         assert outcome.status == "invalid"
-        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", provider.prompt_version)
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider))
         assert stored["status"] == "invalid"
         assert stored["category"] is None  # not stored as a successful label
 
@@ -186,7 +192,7 @@ async def test_non_result_object_is_rejected(tmp_path):
         outcome = await service.analyze(CHAT, 1, MATCHING)
 
         assert outcome.status == "invalid"
-        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", provider.prompt_version)
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider))
         assert stored["status"] == "invalid"
 
 
@@ -202,7 +208,7 @@ async def test_disabled_service_never_calls_network_provider(tmp_path):
         assert outcome.status == STATUS_DISABLED
         assert transport.calls == 0
         assert store.get_ai_analysis(
-            CHAT, 1, provider.provider_name, provider.model, provider.prompt_version
+            CHAT, 1, provider.provider_name, provider.model, eff(provider)
         ) is None
 
 
@@ -237,3 +243,42 @@ async def test_logs_contain_no_text_or_pii_on_success(tmp_path, caplog):
 
         for leaked in ("@ivan_petrov", "ivan@test.ru", "t.me", MATCHING, str(CHAT)):
             assert leaked not in caplog.text
+
+
+async def test_same_criteria_yields_one_result(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        provider = provider_returning(AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))
+        service = MessageAnalysisService(store, provider, enabled=True, criteria="курьер")
+
+        first = await service.analyze(CHAT, 1, MATCHING)
+        second = await service.analyze(CHAT, 1, MATCHING)
+
+        assert first.status == STATUS_SAVED
+        assert second.status == STATUS_DUPLICATE
+        count = store._conn.execute("SELECT COUNT(*) FROM message_ai_analysis").fetchone()[0]
+        assert count == 1
+
+
+async def test_changed_criteria_stores_a_separate_result(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        provider = provider_returning(AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))
+        narrow = MessageAnalysisService(store, provider, enabled=True, criteria="курьер")
+        wide = MessageAnalysisService(store, provider, enabled=True, criteria="курьер, доставка")
+
+        assert (await narrow.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+        # The old criteria result must not satisfy the new criteria identity.
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "fake-model", eff(provider, "курьер, доставка")
+        ) is None
+        assert (await wide.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+
+        count = store._conn.execute("SELECT COUNT(*) FROM message_ai_analysis").fetchone()[0]
+        assert count == 2
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "fake-model", eff(provider, "курьер")
+        ) is not None
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "fake-model", eff(provider, "курьер, доставка")
+        ) is not None

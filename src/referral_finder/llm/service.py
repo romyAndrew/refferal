@@ -40,6 +40,7 @@ from .schema import (
     ai_analysis_row,
     validate_analysis,
 )
+from .versioning import effective_analysis_version
 
 logger = logging.getLogger(__name__)
 
@@ -184,9 +185,13 @@ class MessageAnalysisService:
         return {
             "provider": self._provider.provider_name,
             "model": self._provider.model,
-            "prompt_version": self._provider.prompt_version,
+            "prompt_version": self._effective_version(),
             "prompt_hash": self._provider.prompt_hash,
         }
+
+    def _effective_version(self) -> str:
+        """Effective analysis version: template prompt version + criteria hash."""
+        return effective_analysis_version(self._provider.prompt_version, self._criteria)
 
     def _store_ok(
         self,
