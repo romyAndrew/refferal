@@ -37,6 +37,15 @@ DEFAULT_QUEUE_MAX_SIZE = 1000
 _STOP = object()
 
 
+class _Batch:
+    """Internal queue item carrying several messages for a single transaction."""
+
+    __slots__ = ("messages",)
+
+    def __init__(self, messages):
+        self.messages = messages
+
+
 class MessageWriterError(RuntimeError):
     """Raised when the writer is no longer able to accept messages."""
 
@@ -85,10 +94,21 @@ class MessageWriter:
         self._task.add_done_callback(self._on_task_done)
 
     async def submit(self, message: IncomingMessage) -> None:
-        """Queue ``message`` for persistence, applying backpressure if full.
+        """Queue a single ``message`` for persistence (live path)."""
+        await self._enqueue(message)
+
+    async def submit_batch(self, messages) -> None:
+        """Queue several messages for one persistence transaction (history)."""
+        batch = _Batch(list(messages))
+        if not batch.messages:
+            return
+        await self._enqueue(batch)
+
+    async def _enqueue(self, item) -> None:
+        """Queue ``item`` (a message or a batch), applying backpressure if full.
 
         Raises :class:`MessageWriterError` if the writer has failed, has been
-        stopped, or is shutting down, so a message is never silently withheld
+        stopped, or is shutting down, so an item is never silently withheld
         when nobody will drain the queue. If the caller (for example a Telethon
         handler task) is cancelled while waiting for queue space, the pending
         ``put`` is cancelled too and ``CancelledError`` is re-raised.
@@ -97,11 +117,11 @@ class MessageWriter:
             self._record_failure(self._task)
         if self._failure is not None:
             raise MessageWriterError(
-                "message writer is not running; message was not queued"
+                "message writer is not running; item was not queued"
             ) from self._failure
         if self._stopping:
             raise MessageWriterError(
-                "message writer is shutting down; message was not queued"
+                "message writer is shutting down; item was not queued"
             )
 
         # No await between the shutdown check above and this registration, so a
@@ -110,7 +130,7 @@ class MessageWriter:
         self._active_submits += 1
         self._no_active_submits.clear()
         try:
-            put_task = asyncio.ensure_future(self._queue.put(message))
+            put_task = asyncio.ensure_future(self._queue.put(item))
             try:
                 if self._task is None:
                     # Not started yet: queue now, a later start() will drain it.
@@ -148,15 +168,87 @@ class MessageWriter:
             if self._active_submits == 0:
                 self._no_active_submits.set()
 
+    async def flush(self) -> None:
+        """Wait until everything queued so far has been processed by the writer.
+
+        Used by history reconciliation as a barrier: after ``flush`` returns, all
+        messages submitted before the call have been handed to the store (either
+        inserted or rejected as duplicates). Raises :class:`MessageWriterError`
+        if the writer task has already failed or stops before draining, so the
+        caller never advances a checkpoint over unpersisted messages.
+
+        Per-message persistence errors are counted in :attr:`errors` (and the
+        writer keeps running); callers that need a strict barrier compare that
+        counter before and after the flush.
+        """
+        if self._failure is not None:
+            raise MessageWriterError(
+                "message writer is not running; flush failed"
+            ) from self._failure
+        if self._task is None:
+            # Nothing was ever started; the queue is not being drained.
+            if not self._queue.empty():
+                raise MessageWriterError(
+                    "message writer has not been started; flush failed"
+                )
+            return
+
+        join_task = asyncio.ensure_future(self._queue.join())
+        try:
+            done, _pending = await asyncio.wait(
+                {join_task, self._task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            join_task.cancel()
+            raise
+
+        if join_task in done:
+            exc = join_task.exception()
+            if exc is not None:
+                raise exc
+            if self._failure is not None:
+                raise MessageWriterError(
+                    "message writer failed before flush completed"
+                ) from self._failure
+            return
+
+        join_task.cancel()
+        if self._failure is None and self._task is not None:
+            self._record_failure(self._task)
+        raise MessageWriterError(
+            "message writer stopped before flush completed"
+        ) from self._failure
+
     async def _run(self) -> None:
         while True:
             item = await self._queue.get()
             try:
                 if item is _STOP:
                     return
-                self._persist(item)  # type: ignore[arg-type]
+                if isinstance(item, _Batch):
+                    self._persist_batch(item.messages)
+                else:
+                    self._persist(item)  # type: ignore[arg-type]
             finally:
                 self._queue.task_done()
+
+    def _persist_batch(self, messages) -> None:
+        try:
+            inserted, duplicates = self._store.save_many(messages)
+        except Exception:
+            self.errors += 1
+            logger.exception(
+                "Failed to store a batch of %d message(s)", len(messages)
+            )
+            return
+        self.saved += inserted
+        self.duplicates += duplicates
+        logger.info(
+            "Stored message batch size=%d inserted=%d duplicates=%d",
+            len(messages),
+            inserted,
+            duplicates,
+        )
 
     def _persist(self, message: IncomingMessage) -> None:
         try:

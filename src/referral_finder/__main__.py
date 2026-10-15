@@ -28,7 +28,9 @@ async def _run(config: Config) -> None:
     # runs with a configured DB_PATH; importing the package never touches it.
     store = MessageStore(config.db_path)
     writer = MessageWriter(store)
-    runner = TelegramRunner(config, writer=writer, store=store)
+    # history_sync=True: reconcile missed messages on startup (bounded first
+    # scan, then everything after the per-chat checkpoint).
+    runner = TelegramRunner(config, writer=writer, store=store, history_sync=True)
     try:
         await runner.run_forever()
     finally:

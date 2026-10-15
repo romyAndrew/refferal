@@ -23,8 +23,9 @@ from typing import Awaitable, Callable, Iterable, Optional, Tuple
 from telethon import TelegramClient, events
 
 from .config import Config, ConfigError
+from .history import sync_history
 from .ingest import MessageWriter, MessageWriterError
-from .models import IncomingMessage
+from .models import IncomingMessage, incoming_from_object
 from .storage import MessageStore
 
 logger = logging.getLogger(__name__)
@@ -83,18 +84,7 @@ def extract_message(event) -> IncomingMessage:
     ``id``, ``date``, ``sender_id``, ``raw_text``), which keeps it testable
     without a real Telegram event.
     """
-    text = getattr(event, "raw_text", None)
-    sender_id = getattr(event, "sender_id", None)
-    date = getattr(event, "date", None)
-    date_utc = int(date.timestamp()) if date is not None else 0
-    return IncomingMessage(
-        chat_id=int(event.chat_id),
-        message_id=int(event.id),
-        date_utc=date_utc,
-        received_at_utc=int(time.time()),
-        text=text if text else None,
-        sender_id=int(sender_id) if sender_id is not None else None,
-    )
+    return incoming_from_object(event, received_at_utc=int(time.time()))
 
 
 def to_log_record(message: IncomingMessage) -> MessageLogRecord:
@@ -196,11 +186,13 @@ class TelegramRunner:
         client: Optional[TelegramClient] = None,
         writer: Optional[MessageWriter] = None,
         store: Optional[MessageStore] = None,
+        history_sync: bool = False,
     ):
         self._config = config
         self._client = client if client is not None else create_client(config)
         self._writer = writer
         self._store = store
+        self._history_sync = history_sync
         self._registered = False
 
     @property
@@ -240,6 +232,16 @@ class TelegramRunner:
         # registered, so the fetched updates can be processed by our handler.
         await self._client.catch_up()
         logger.info("Telegram client connected and caught up.")
+
+        # catch_up() is not a delivery guarantee; reconcile recent history for
+        # each configured chat to close small gaps left while offline.
+        if self._history_sync and self._store is not None and self._writer is not None:
+            await self.sync_history()
+
+    async def sync_history(self):
+        """Run bounded history reconciliation for the configured chats."""
+        chat_ids = parse_chat_ids(self._config.chats)
+        return await sync_history(self._client, chat_ids, self._store, self._writer)
 
     async def run_forever(self) -> None:
         """Register, connect, recover, then wait until disconnected."""

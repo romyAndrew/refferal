@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 from .models import IncomingMessage
 
@@ -54,6 +54,29 @@ FROM messages
 ORDER BY chat_id, message_id
 """
 
+# Per-chat history reconciliation checkpoint. ``last_message_id`` is the newest
+# message ID whose entire history range has been fully examined (and its text
+# messages persisted or deliberately skipped). It is separate from the
+# ``messages`` table on purpose: ``MAX(message_id)`` cannot be used as a
+# checkpoint because it would hide gaps in the stored history.
+_SYNC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_sync_state (
+    chat_id         INTEGER PRIMARY KEY,
+    last_message_id INTEGER NOT NULL,
+    updated_at_utc  INTEGER NOT NULL
+)
+"""
+
+_SELECT_CHECKPOINT = "SELECT last_message_id FROM chat_sync_state WHERE chat_id = ?"
+
+_UPSERT_CHECKPOINT = """
+INSERT INTO chat_sync_state (chat_id, last_message_id, updated_at_utc)
+VALUES (?, ?, ?)
+ON CONFLICT(chat_id) DO UPDATE SET
+    last_message_id = excluded.last_message_id,
+    updated_at_utc = excluded.updated_at_utc
+"""
+
 
 class MessageStore:
     """Thin SQLite wrapper around the ``messages`` table.
@@ -71,6 +94,9 @@ class MessageStore:
         self._closed = False
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.execute(_SCHEMA)
+        # Create the checkpoint table on existing databases too (no data loss,
+        # no table recreation).
+        self._conn.execute(_SYNC_SCHEMA)
         self._conn.commit()
 
     @property
@@ -98,6 +124,33 @@ class MessageStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def save_many(self, messages: Iterable[IncomingMessage]) -> Tuple[int, int]:
+        """Insert many messages in a single transaction.
+
+        Returns ``(inserted, duplicates)``. Used for bulk history
+        reconciliation to avoid one commit per message. Deduplication is the
+        same ``ON CONFLICT(chat_id, message_id) DO NOTHING`` rule, so a repeated
+        key is never inserted twice or overwritten.
+        """
+        rows = [
+            (
+                message.chat_id,
+                message.message_id,
+                message.date_utc,
+                message.received_at_utc,
+                message.text,
+                message.sender_id,
+            )
+            for message in messages
+        ]
+        if not rows:
+            return 0, 0
+        before = self._conn.total_changes
+        self._conn.executemany(_INSERT, rows)
+        self._conn.commit()
+        inserted = self._conn.total_changes - before
+        return int(inserted), len(rows) - int(inserted)
+
     def count(self) -> int:
         """Return the number of stored messages."""
         return int(self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
@@ -109,6 +162,29 @@ class MessageStore:
     def fetch_all(self) -> list:
         """Return all stored rows ordered by ``(chat_id, message_id)``."""
         return self._conn.execute(_SELECT_ALL).fetchall()
+
+    def get_checkpoint(self, chat_id: int) -> Optional[int]:
+        """Return the last fully reconciled message ID for ``chat_id``.
+
+        ``None`` means the chat has never been history-synced, which triggers
+        the bounded initial reconciliation.
+        """
+        row = self._conn.execute(_SELECT_CHECKPOINT, (int(chat_id),)).fetchone()
+        return int(row[0]) if row is not None else None
+
+    def set_checkpoint(
+        self, chat_id: int, last_message_id: int, updated_at_utc: int
+    ) -> None:
+        """Store (or replace) the reconciliation checkpoint for ``chat_id``.
+
+        Only call this after the range up to ``last_message_id`` has been fully
+        processed, so the checkpoint never skips unprocessed messages.
+        """
+        self._conn.execute(
+            _UPSERT_CHECKPOINT,
+            (int(chat_id), int(last_message_id), int(updated_at_utc)),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close the connection. Safe to call more than once."""

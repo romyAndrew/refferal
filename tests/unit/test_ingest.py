@@ -145,6 +145,29 @@ async def test_writer_counts_duplicates_without_second_row(tmp_path):
     store.close()
 
 
+async def test_writer_persists_batch_and_counts_duplicates(tmp_path):
+    store = MessageStore(tmp_path / "messages.db")
+    writer = MessageWriter(store)
+    await writer.start()
+    try:
+        await writer.submit_batch(
+            [
+                make_message(message_id=1),
+                make_message(message_id=2),
+                make_message(message_id=2),  # duplicate within the same batch
+            ]
+        )
+        await writer.flush()
+    finally:
+        await writer.stop()
+
+    assert writer.saved == 2
+    assert writer.duplicates == 1
+    assert writer.errors == 0
+    assert store.count() == 2
+    store.close()
+
+
 async def test_writer_stop_without_start_is_noop():
     writer = MessageWriter(BrokenStore())
     await writer.stop()

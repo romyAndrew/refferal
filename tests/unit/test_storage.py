@@ -130,3 +130,70 @@ def test_close_is_idempotent(tmp_path):
     store = MessageStore(tmp_path / "messages.db")
     store.close()
     store.close()
+
+
+# --- sync checkpoints ----------------------------------------------------
+
+
+def test_save_many_inserts_and_reports_duplicates(tmp_path):
+    with MessageStore(tmp_path / "messages.db") as store:
+        store.save(make_message(message_id=1, text="existing"))
+        inserted, duplicates = store.save_many(
+            [
+                make_message(message_id=1, text="dup"),
+                make_message(message_id=2, text="new two"),
+                make_message(message_id=3, text="new three"),
+            ]
+        )
+        assert (inserted, duplicates) == (2, 1)
+        assert store.count() == 3
+        assert store.fetch(-1001234567890, 1)[4] == "existing"
+
+
+def test_save_many_with_empty_iterable_is_noop(tmp_path):
+    with MessageStore(tmp_path / "messages.db") as store:
+        assert store.save_many([]) == (0, 0)
+        assert store.count() == 0
+
+
+def test_checkpoint_round_trip_and_update(tmp_path):
+    with MessageStore(tmp_path / "messages.db") as store:
+        assert store.get_checkpoint(-1001) is None
+        store.set_checkpoint(-1001, 40, 1700000000)
+        assert store.get_checkpoint(-1001) == 40
+        store.set_checkpoint(-1001, 55, 1700000050)
+        assert store.get_checkpoint(-1001) == 55
+
+
+def test_checkpoints_are_isolated_per_chat(tmp_path):
+    with MessageStore(tmp_path / "messages.db") as store:
+        store.set_checkpoint(-1001, 10, 1)
+        store.set_checkpoint(-1002, 99, 2)
+        assert store.get_checkpoint(-1001) == 10
+        assert store.get_checkpoint(-1002) == 99
+
+
+def test_existing_database_is_migrated_without_data_loss(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+        "date_utc INTEGER NOT NULL, received_at_utc INTEGER NOT NULL, "
+        "text TEXT, sender_id INTEGER, PRIMARY KEY (chat_id, message_id))"
+    )
+    conn.execute("INSERT INTO messages VALUES (-1, 5, 1, 1, 'old text', 9)")
+    conn.commit()
+    conn.close()
+
+    store = MessageStore(db_path)
+    assert store.count() == 1
+    assert store.fetch(-1, 5)[4] == "old text"
+    assert store.get_checkpoint(-1) is None
+    store.set_checkpoint(-1, 5, 123)
+    store.close()
+
+    reopened = MessageStore(db_path)
+    assert reopened.count() == 1
+    assert reopened.get_checkpoint(-1) == 5
+    reopened.close()

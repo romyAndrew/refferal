@@ -4,15 +4,16 @@ A local tool that (in later stages) will monitor selected Telegram chats via
 the official MTProto API (Telethon) and store new messages locally so they can
 be reviewed for courier-job interest.
 
-**Current status: stages 3–4 — SQLite storage, deduplication, and pipeline
-robustness.**
+**Current status: stages 3–5 — SQLite storage, deduplication, pipeline
+robustness, and bounded startup history reconciliation.**
 New incoming text messages are persisted to SQLite through a bounded queue with
 a single writer; repeated delivery of the same `(chat_id, message_id)` is
-ignored. Messages without text or a caption are skipped. Writer failures,
-DB-write errors, backpressure, and start/stop lifecycle are covered by offline
-integration tests against temporary databases. These stages add no live checks:
-a **real Telegram connection is not run here**. The message text is never
-written to the logs.
+ignored. Messages without text or a caption are skipped. On startup the client
+also reconciles recent history for each configured chat to close gaps left while
+it was offline. Writer failures, DB-write errors, backpressure, lifecycle, and
+reconciliation are covered by offline integration tests against temporary
+databases. No live checks are run here: a **real Telegram connection is not run
+by the test suite**. The message text is never written to the logs.
 
 ## Requirements
 
@@ -31,8 +32,9 @@ src/referral_finder/
   config.py            env + chats.txt loading and validation
   logging_setup.py     logging with secret masking
   models.py            message DTO (Telethon-independent shape)
-  storage.py           SQLite store for messages + deduplication
+  storage.py           SQLite store for messages + deduplication + checkpoints
   ingest.py            bounded queue + single writer pipeline
+  history.py           bounded startup history reconciliation
   telegram_client.py   Telethon client, incoming handler, lifecycle
 tests/unit/        unit + integration tests (no Telegram, no network)
 ```
@@ -63,6 +65,29 @@ surfaced: `submit()` raises `MessageWriterError` instead of blocking forever on
 a queue nobody drains, `stop()` raises it after the task ends, and the runner
 logs it during shutdown. `start()`/`stop()` are re-entrant, so the writer can be
 restarted without leaking tasks.
+
+### Startup history reconciliation
+
+`client.catch_up()` is not a delivery guarantee, so on startup (after the client
+connects and catches up) the app scans the configured chats' history and fills
+gaps through the same single-writer pipeline. Deduplication by
+`(chat_id, message_id)` makes overlap with live events harmless.
+
+- **First scan of a chat** (no checkpoint yet) is bounded to the most recent
+  `200` messages. This finds small gaps (for example a stored id 28 with 26 and
+  27 missing) without importing the whole archive, and is why `MAX(message_id)`
+  is *not* used as a checkpoint.
+- **Later scans** read everything after the stored checkpoint, paginated, so a
+  long offline period is not silently truncated.
+- The checkpoint is stored **per chat** in the `chat_sync_state` table of the
+  same SQLite database (created on existing databases too, without data loss)
+  and is advanced only after a page has been fully persisted.
+- Pages are written as a single batched transaction; on any fetch or write
+  error the checkpoint stays at the last fully processed page, so no message is
+  skipped. Errors are logged (chat id and range/counts only, never text).
+
+This is a one-shot startup scan, not a periodic poller, and it never downloads
+media.
 
 ## Setup (PowerShell)
 
@@ -119,16 +144,17 @@ code (it does not print a traceback).
 
 With a valid `.env` and a non-empty `config/chats.txt`, the command opens the
 SQLite database at `DB_PATH`, starts the Telethon client, registers the
-incoming-message handler, runs the standard recovery (`client.catch_up()`), and
-waits until disconnected. New text messages are written to SQLite; repeated
-delivery of the same message is ignored.
+incoming-message handler, runs the standard recovery (`client.catch_up()`),
+reconciles recent history for each configured chat, and waits until
+disconnected. New text messages are written to SQLite; repeated delivery of the
+same message is ignored.
 
 The database (and its parent directory) is created only when the command runs,
 i.e. only with a configured `DB_PATH`. Set `DB_PATH` to a path **outside the
 repository** (the default `data/messages.db` is git-ignored only as a safety
 net).
 
-> **Live connection is not run as part of stage 3.** Running the command above
+> **Live connection is not run by the test suite.** Running the command above
 > opens a real Telegram connection and may prompt for the login code on the
 > first use. That live check is performed separately, after explicit approval.
 > First-time login is interactive; subsequent runs reuse the session file.
