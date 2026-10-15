@@ -122,3 +122,90 @@ def test_schema_migrates_existing_database(tmp_path):
         ).fetchone()
         assert found == ("message_ai_analysis",)
         assert store.count() == 1  # existing data preserved
+
+
+# --- retry policy ----------------------------------------------------------
+
+
+def test_upsert_increments_attempts_on_failure(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        store.upsert_ai_analysis([row(1, None, status="error", error="timeout")])
+        store.upsert_ai_analysis([row(1, None, status="error", error="timeout")])
+        stored = store.get_ai_analysis(-1, 1, PROVIDER, MODEL, PROMPT_VERSION)
+        assert stored["status"] == "error"
+        assert stored["attempts"] == 2
+
+
+def test_upsert_never_overwrites_a_success(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        store.upsert_ai_analysis([row(1, AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))])
+        store.upsert_ai_analysis([row(1, None, status="error", error="boom")])
+        stored = store.get_ai_analysis(-1, 1, PROVIDER, MODEL, PROMPT_VERSION)
+        assert stored["status"] == "ok"
+        assert stored["attempts"] == 1
+
+
+def test_iter_ai_unprocessed_skips_success_and_retries_failed(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        store.save(make_message(2))
+        store.save(make_message(3))
+        store.upsert_ai_analysis([row(1, AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))])
+        store.upsert_ai_analysis([row(2, None, status="error", error="x")])
+
+        def ids(max_attempts):
+            batches = list(
+                store.iter_ai_unprocessed(
+                    PROVIDER, MODEL, PROMPT_VERSION, max_attempts=max_attempts
+                )
+            )
+            return sorted(mid for batch in batches for _, mid, _ in batch)
+
+        assert ids(max_attempts=3) == [2, 3]  # success skipped, failure retryable
+        assert ids(max_attempts=1) == [3]  # failure exhausted, not retried
+
+
+def test_count_ai_unprocessed_respects_max_attempts(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        store.upsert_ai_analysis([row(1, None, status="error", error="x")])
+        assert store.count_ai_unprocessed(PROVIDER, MODEL, PROMPT_VERSION, max_attempts=3) == 1
+        assert store.count_ai_unprocessed(PROVIDER, MODEL, PROMPT_VERSION, max_attempts=1) == 0
+
+
+def test_migration_adds_attempts_to_existing_ai_table(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+        "date_utc INTEGER NOT NULL, received_at_utc INTEGER NOT NULL, "
+        "text TEXT, sender_id INTEGER, PRIMARY KEY (chat_id, message_id))"
+    )
+    conn.execute(
+        "CREATE TABLE message_ai_analysis ("
+        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, provider TEXT NOT NULL, "
+        "model TEXT NOT NULL, prompt_version TEXT NOT NULL, prompt_hash TEXT NOT NULL, "
+        "status TEXT NOT NULL, relevant INTEGER, category TEXT, confidence REAL, "
+        "explanation TEXT, error TEXT, analyzed_at_utc INTEGER NOT NULL, "
+        "PRIMARY KEY (chat_id, message_id, provider, model, prompt_version))"
+    )
+    conn.execute("INSERT INTO messages VALUES (-1, 5, 1, 1, 'old text', 9)")
+    conn.execute(
+        "INSERT INTO message_ai_analysis VALUES "
+        "(-1, 5, 'deepseek', 'deepseek-flash', 'v1', 'h', 'ok', 1, 'job_interest', "
+        "0.5, 'e', NULL, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with MessageStore(db_path) as store:
+        columns = {
+            r[1] for r in store._conn.execute("PRAGMA table_info(message_ai_analysis)")
+        }
+        assert "attempts" in columns
+        stored = store.get_ai_analysis(-1, 5, "deepseek", "deepseek-flash", "v1")
+        assert stored["status"] == "ok"  # existing row preserved
+        assert stored["attempts"] == 0  # backfilled default

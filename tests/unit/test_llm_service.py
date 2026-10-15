@@ -221,7 +221,7 @@ async def test_storage_error_is_reported_without_leaking_data(tmp_path, caplog):
         def boom(rows):
             raise RuntimeError("db down")
 
-        store.save_ai_analysis = boom  # type: ignore[assignment]
+        store.upsert_ai_analysis = boom  # type: ignore[assignment]
 
         with caplog.at_level(logging.DEBUG, logger="referral_finder.llm"):
             outcome = await service.analyze(CHAT, 1, MATCHING)
@@ -282,3 +282,40 @@ async def test_changed_criteria_stores_a_separate_result(tmp_path):
         assert store.get_ai_analysis(
             CHAT, 1, "fake", "fake-model", eff(provider, "курьер, доставка")
         ) is not None
+
+
+async def test_success_is_not_reanalyzed(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        provider = provider_returning(AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))
+        service = MessageAnalysisService(store, provider, enabled=True)
+
+        await service.analyze(CHAT, 1, MATCHING)
+        second = await service.analyze(CHAT, 1, MATCHING)
+
+        assert second.status == STATUS_DUPLICATE
+        assert len(provider.calls) == 1  # provider not called again
+
+
+async def test_temporary_failure_is_retried(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+
+        def failing(request):
+            raise LLMResponseError("transient")
+
+        bad_provider = FakeProvider(failing)
+        first = MessageAnalysisService(store, bad_provider, enabled=True)
+        assert (await first.analyze(CHAT, 1, MATCHING)).status == "invalid"
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(bad_provider))
+        assert stored["status"] == "invalid"
+        assert stored["attempts"] == 1
+
+        # A later attempt with a working provider succeeds and replaces the
+        # failure (a temporary error must not block the message forever).
+        good = FakeProvider(handler=lambda request: AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))
+        second = MessageAnalysisService(store, good, enabled=True)
+        assert (await second.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(good))
+        assert stored["status"] == "ok"
+        assert stored["attempts"] == 2

@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from ..storage import MessageStore
+from ..storage import DEFAULT_MAX_ATTEMPTS, MessageStore
 from .fake import FakeProvider
 from .service import (
     STATUS_DUPLICATE,
@@ -59,6 +59,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--criteria", default="", help="search criteria text passed to the provider"
     )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "how many times a failed message is retried before it is left "
+            f"alone (default {DEFAULT_MAX_ATTEMPTS})"
+        ),
+    )
     return parser
 
 
@@ -73,14 +82,14 @@ def _empty_counts() -> dict:
     }
 
 
-async def _run_pipeline(store, provider, enabled, criteria, limit) -> dict:
+async def _run_pipeline(store, provider, enabled, criteria, limit, max_attempts) -> dict:
     service = MessageAnalysisService(
         store, provider, enabled=enabled, criteria=criteria
     )
     version = effective_analysis_version(provider.prompt_version, criteria)
     counts = _empty_counts()
     for batch in store.iter_ai_unprocessed(
-        provider.provider_name, provider.model, version
+        provider.provider_name, provider.model, version, max_attempts=max_attempts
     ):
         for chat_id, message_id, text in batch:
             if limit is not None and counts["checked"] >= limit:
@@ -132,7 +141,10 @@ def run(
         if args.dry_run:
             version = effective_analysis_version(provider.prompt_version, args.criteria)
             pending = store.count_ai_unprocessed(
-                provider.provider_name, provider.model, version
+                provider.provider_name,
+                provider.model,
+                version,
+                max_attempts=args.max_attempts,
             )
             print(
                 f"dry_run=1 pending={pending} version={version}"
@@ -144,7 +156,9 @@ def run(
             return 0
 
         counts = asyncio.run(
-            _run_pipeline(store, provider, enabled, args.criteria, args.limit)
+            _run_pipeline(
+                store, provider, enabled, args.criteria, args.limit, args.max_attempts
+            )
         )
         print(_format(counts, enabled=True))
         return 0

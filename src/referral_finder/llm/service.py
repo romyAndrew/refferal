@@ -102,6 +102,10 @@ class MessageAnalysisService:
         if not self._enabled:
             return AnalysisOutcome(STATUS_DISABLED)
 
+        # A successful result is idempotent: never call the provider again.
+        if self._existing_success(chat_id, message_id):
+            return AnalysisOutcome(STATUS_DUPLICATE, matched=True)
+
         gate = prefilter(text)
         if not gate.matched:
             return AnalysisOutcome(
@@ -193,6 +197,17 @@ class MessageAnalysisService:
         """Effective analysis version: template prompt version + criteria hash."""
         return effective_analysis_version(self._provider.prompt_version, self._criteria)
 
+    def _existing_success(self, chat_id: int, message_id: int) -> bool:
+        """True when this version already has a successful stored result."""
+        stored = self._store.get_ai_analysis(
+            chat_id,
+            message_id,
+            self._provider.provider_name,
+            self._provider.model,
+            self._effective_version(),
+        )
+        return stored is not None and stored.get("status") == STATUS_OK
+
     def _store_ok(
         self,
         chat_id: int,
@@ -210,7 +225,7 @@ class MessageAnalysisService:
             **self._provider_meta(),
         )
         try:
-            inserted = self._store.save_ai_analysis([row])
+            inserted = self._store.upsert_ai_analysis([row])
         except Exception:
             # Never log the text or the local ids here.
             logger.exception("Failed to store AI analysis result")
@@ -249,7 +264,7 @@ class MessageAnalysisService:
             **self._provider_meta(),
         )
         try:
-            self._store.save_ai_analysis([row])
+            self._store.upsert_ai_analysis([row])
         except Exception:
             logger.exception("Failed to store AI analysis failure record")
         return AnalysisOutcome(

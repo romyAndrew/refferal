@@ -174,10 +174,19 @@ CREATE TABLE IF NOT EXISTS message_ai_analysis (
     explanation        TEXT,
     error              TEXT,
     analyzed_at_utc    INTEGER NOT NULL,
+    attempts           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, message_id, provider, model, prompt_version),
     FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
 )
 """
+
+# Columns added after the initial AI schema (existing DBs are migrated in place
+# with ALTER TABLE ADD COLUMN; no data loss, primary key unchanged).
+_AI_MIGRATION_COLUMNS = (("attempts", "INTEGER NOT NULL DEFAULT 0"),)
+
+# Retry policy default: a temporary failure is retried until this many attempts
+# have been recorded for the same analysis version, then it is left alone.
+DEFAULT_MAX_ATTEMPTS = 3
 
 _AI_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_ai_model_category "
@@ -193,9 +202,32 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(chat_id, message_id, provider, model, prompt_version) DO NOTHING
 """
 
+# Upsert used by the analysis service: records an attempt (attempts+1 on retry)
+# and updates the outcome, but never overwrites an already-successful row. This
+# keeps a successful classification idempotent while allowing a temporary
+# failure to be retried (bounded by DEFAULT_MAX_ATTEMPTS in the selection query).
+_AI_UPSERT = """
+INSERT INTO message_ai_analysis (
+    chat_id, message_id, provider, model, prompt_version, prompt_hash,
+    status, relevant, category, confidence, explanation, error, analyzed_at_utc,
+    attempts
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+ON CONFLICT(chat_id, message_id, provider, model, prompt_version) DO UPDATE SET
+    status = excluded.status,
+    relevant = excluded.relevant,
+    category = excluded.category,
+    confidence = excluded.confidence,
+    explanation = excluded.explanation,
+    error = excluded.error,
+    analyzed_at_utc = excluded.analyzed_at_utc,
+    attempts = message_ai_analysis.attempts + 1
+WHERE message_ai_analysis.status != 'ok'
+"""
+
 _SELECT_AI = """
 SELECT status, relevant, category, confidence, explanation, error,
-       prompt_hash, analyzed_at_utc
+       prompt_hash, analyzed_at_utc, attempts
 FROM message_ai_analysis
 WHERE chat_id = ? AND message_id = ? AND provider = ? AND model = ?
   AND prompt_version = ?
@@ -211,7 +243,7 @@ LEFT JOIN message_ai_analysis a
    AND a.model = ?
    AND a.prompt_version = ?
 WHERE m.text IS NOT NULL
-  AND a.chat_id IS NULL
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
   AND (m.chat_id, m.message_id) > (?, ?)
 ORDER BY m.chat_id, m.message_id
 LIMIT ?
@@ -226,7 +258,8 @@ LEFT JOIN message_ai_analysis a
    AND a.provider = ?
    AND a.model = ?
    AND a.prompt_version = ?
-WHERE m.text IS NOT NULL AND a.chat_id IS NULL
+WHERE m.text IS NOT NULL
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
 """
 
 _SELECT_UNCLASSIFIED = """
@@ -312,6 +345,7 @@ class MessageStore:
         self._conn.execute(_CLASSIFICATION_INDEX)
         self._conn.execute(_AI_SCHEMA)
         self._conn.execute(_AI_INDEX)
+        self._migrate_ai_analysis()
         self._conn.commit()
 
     def _migrate_messages(self) -> None:
@@ -322,6 +356,17 @@ class MessageStore:
             if name not in existing:
                 self._conn.execute(
                     f"ALTER TABLE messages ADD COLUMN {name} {declaration}"
+                )
+
+    def _migrate_ai_analysis(self) -> None:
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(message_ai_analysis)")
+        }
+        for name, declaration in _AI_MIGRATION_COLUMNS:
+            if name not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE message_ai_analysis ADD COLUMN {name} {declaration}"
                 )
 
     @property
@@ -547,6 +592,22 @@ class MessageStore:
         self._conn.commit()
         return int(self._conn.total_changes - before)
 
+    def upsert_ai_analysis(self, rows) -> int:
+        """Record analysis attempts and outcomes; keep a success idempotent.
+
+        Each row has the same shape as :meth:`save_ai_analysis`. On conflict the
+        row is updated and its ``attempts`` counter is incremented, **unless** an
+        existing row is already successful (``status='ok'``), which is never
+        overwritten. Returns the number of inserted or updated rows.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        before = self._conn.total_changes
+        self._conn.executemany(_AI_UPSERT, rows)
+        self._conn.commit()
+        return int(self._conn.total_changes - before)
+
     def get_ai_analysis(
         self, chat_id, message_id, provider, model, prompt_version
     ) -> Optional[dict]:
@@ -572,23 +633,38 @@ class MessageStore:
             "error": row[5],
             "prompt_hash": row[6],
             "analyzed_at_utc": int(row[7]),
+            "attempts": int(row[8]),
         }
 
-    def count_ai_unprocessed(self, provider, model, prompt_version) -> int:
-        """Number of text messages with no AI result for (provider, model, prompt)."""
+    def count_ai_unprocessed(
+        self, provider, model, prompt_version, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    ) -> int:
+        """Number of messages still needing AI analysis for this version.
+
+        A message counts when it has no row yet, or a failed row whose
+        ``attempts`` is still below ``max_attempts`` (temporary errors stay
+        retryable; successful rows never count).
+        """
         return int(
             self._conn.execute(
                 _COUNT_AI_UNPROCESSED,
-                (str(provider), str(model), str(prompt_version)),
+                (str(provider), str(model), str(prompt_version), int(max_attempts)),
             ).fetchone()[0]
         )
 
-    def iter_ai_unprocessed(self, provider, model, prompt_version, batch_size: int = 500):
+    def iter_ai_unprocessed(
+        self,
+        provider,
+        model,
+        prompt_version,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        batch_size: int = 500,
+    ):
         """Yield batches of ``(chat_id, message_id, text)`` needing AI analysis.
 
-        Keyset-paginated by ``(chat_id, message_id)`` for the given
-        (provider, model, prompt_version) so a run can be resumed without
-        re-reading already-analysed rows.
+        Successful rows are skipped; failed rows are retried until their
+        ``attempts`` reach ``max_attempts``. Keyset-paginated by
+        ``(chat_id, message_id)``.
         """
         last_chat = _INT64_MIN
         last_message = _INT64_MIN
@@ -599,6 +675,7 @@ class MessageStore:
                     str(provider),
                     str(model),
                     str(prompt_version),
+                    int(max_attempts),
                     last_chat,
                     last_message,
                     int(batch_size),
