@@ -22,11 +22,12 @@ from typing import Awaitable, Callable, Iterable, Optional, Tuple
 
 from telethon import TelegramClient, events
 
-from .config import Config, ConfigError
+from .config import Config, ConfigError, parse_chat_entries
 from .history import sync_history
 from .ingest import MessageWriter, MessageWriterError
-from .models import IncomingMessage, incoming_from_object
+from .models import IncomingMessage, build_incoming, incoming_from_object
 from .storage import MessageStore
+from .topics import TopicResolver
 
 logger = logging.getLogger(__name__)
 
@@ -98,28 +99,56 @@ def to_log_record(message: IncomingMessage) -> MessageLogRecord:
     )
 
 
-async def handle_new_message(event, writer: Optional[MessageWriter] = None) -> None:
+async def handle_new_message(
+    event,
+    writer: Optional[MessageWriter] = None,
+    chat_entity=None,
+    topic_resolver: Optional[TopicResolver] = None,
+) -> None:
     """Handle a new incoming message.
 
     Logs a minimal technical record and never the message text. Messages without
     text or a caption are skipped (per SPEC FR-11). When ``writer`` is provided,
     text-bearing messages are queued for persistence. Extraction failures are
-    logged explicitly so they are not silently swallowed.
+    logged explicitly so they are not silently swallowed. ``chat_entity`` and
+    ``topic_resolver`` are optional and only used to enrich forum metadata.
     """
     try:
-        message = extract_message(event)
+        message = await build_incoming(
+            event,
+            received_at_utc=int(time.time()),
+            chat_entity=chat_entity,
+            topic_resolver=topic_resolver,
+        )
     except Exception:
         logger.exception("Failed to extract fields from a new message event")
         return
 
     record = to_log_record(message)
     logger.info(
-        "New message: chat_id=%s message_id=%s date_utc=%s text_length=%s",
+        "New message: chat_id=%s message_id=%s date_utc=%s text_length=%s "
+        "topic_id=%s topic_title_known=%s",
         record.chat_id,
         record.message_id,
         record.date_utc,
         record.text_length,
+        message.topic_id,
+        message.topic_title is not None,
     )
+    if message.topic_id is not None:
+        logger.debug(
+            "Topic resolved: chat_id=%s message_id=%s topic_id=%s topic_title_known=%s",
+            message.chat_id,
+            message.message_id,
+            message.topic_id,
+            message.topic_title is not None,
+        )
+    elif chat_entity is not None and getattr(chat_entity, "forum", False):
+        logger.warning(
+            "Forum message without a topic id: chat_id=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
 
     if message.text is None:
         logger.debug(
@@ -158,15 +187,23 @@ async def handle_new_message(event, writer: Optional[MessageWriter] = None) -> N
 
 def make_message_handler(
     writer: Optional[MessageWriter],
+    entities_by_chat_id=None,
+    topic_resolver: Optional[TopicResolver] = None,
 ) -> Callable[[object], Awaitable[None]]:
-    """Bind ``writer`` to :func:`handle_new_message` for Telethon registration.
+    """Bind ``writer`` (and optional forum metadata) to the handler.
 
-    Telethon calls handlers with a single ``event`` argument, so the writer is
-    captured in a closure rather than passed by the framework.
+    Telethon calls handlers with a single ``event`` argument, so the writer and
+    the per-chat entity map are captured in a closure. The dict is captured by
+    reference: entities resolved after registration are still visible.
     """
 
+    entities = entities_by_chat_id if entities_by_chat_id is not None else {}
+
     async def handler(event) -> None:
-        await handle_new_message(event, writer=writer)
+        entity = entities.get(getattr(event, "chat_id", None))
+        await handle_new_message(
+            event, writer=writer, chat_entity=entity, topic_resolver=topic_resolver
+        )
 
     return handler
 
@@ -194,6 +231,10 @@ class TelegramRunner:
         self._store = store
         self._history_sync = history_sync
         self._registered = False
+        # chat_id -> resolved Telegram entity. Captured by reference in the
+        # handler, so entities resolved after registration remain visible.
+        self._entities_by_chat_id: dict = {}
+        self._topic_resolver = TopicResolver(self._client)
 
     @property
     def client(self) -> TelegramClient:
@@ -203,31 +244,145 @@ class TelegramRunner:
     def writer(self) -> Optional[MessageWriter]:
         return self._writer
 
-    def register(self, handler=None) -> None:
-        """Register the inbound-message handler.
+    def _configured_chat_ids(self):
+        entries = parse_chat_entries(self._config.chats)
+        ids = list(entries.ids)
+        for chat_id in self._entities_by_chat_id:
+            if chat_id not in ids:
+                ids.append(chat_id)
+        return tuple(ids)
 
-        Must happen before :meth:`start` (and therefore before ``catch_up``) so
-        that recovered updates are processed by our handler. When no explicit
-        ``handler`` is passed and a writer is attached, the handler is bound to
-        that writer.
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        return " ".join(str(title).split()).casefold()
+
+    async def _resolve_titles(self, titles) -> dict:
+        """Resolve exact ``title:`` entries to forum supergroup entities.
+
+        Uses only dialogs visible to the account. Exact (normalized) match; no
+        fuzzy search. Missing, ambiguous, or non-forum matches raise
+        :class:`ConfigError`.
+        """
+        dialogs = await self._client.get_dialogs()
+        by_title: dict = {}
+        for dialog in dialogs:
+            name = getattr(dialog, "name", None)
+            entity = getattr(dialog, "entity", None)
+            if name is None or entity is None:
+                continue
+            by_title.setdefault(self._normalize_title(name), []).append(entity)
+
+        resolved: dict = {}
+        for title in titles:
+            matches = by_title.get(self._normalize_title(title), [])
+            if not matches:
+                logger.error("Configured chat title not found: title=%r", title)
+                raise ConfigError(
+                    f"Supergroup with title {title!r} was not found among your "
+                    "dialogs. Check the exact title or use a numeric chat id."
+                )
+            if len(matches) > 1:
+                logger.error(
+                    "Configured chat title is ambiguous: title=%r matches=%d",
+                    title,
+                    len(matches),
+                )
+                raise ConfigError(
+                    f"Multiple supergroups match the title {title!r}; "
+                    "specify the numeric chat ID instead."
+                )
+            entity = matches[0]
+            is_forum = getattr(entity, "megagroup", False) and getattr(
+                entity, "forum", False
+            )
+            if not is_forum:
+                logger.error(
+                    "Configured title is not a forum supergroup: title=%r", title
+                )
+                raise ConfigError(
+                    f"Chat {title!r} is not a forum supergroup with topics enabled."
+                )
+            chat_id = int(entity.id)
+            resolved[chat_id] = entity
+            logger.info(
+                "Resolved configured title %r to forum supergroup chat_id=%s",
+                title,
+                chat_id,
+            )
+        return resolved
+
+    async def _load_missing_entities(self, chat_ids) -> None:
+        """Best-effort entity lookup for numeric chats (for forum metadata)."""
+        if not hasattr(self._client, "get_entity"):
+            return
+        for chat_id in chat_ids:
+            chat_id = int(chat_id)
+            if chat_id in self._entities_by_chat_id:
+                continue
+            try:
+                entity = await self._client.get_entity(chat_id)
+                self._entities_by_chat_id[chat_id] = entity
+            except Exception:
+                logger.warning(
+                    "Could not resolve entity for configured chat_id=%s; "
+                    "topic metadata may be unavailable.",
+                    chat_id,
+                )
+
+    def register(self, handler=None, chat_ids=None) -> None:
+        """Register the inbound-message handler for ``chat_ids``.
+
+        Must happen before ``catch_up`` so recovered updates are processed.
+        ``chat_ids`` may be passed explicitly (after resolving title entries);
+        when omitted, numeric ids are parsed from the config (title entries
+        cannot be resolved without a connected client).
         """
         if handler is None:
-            handler = make_message_handler(self._writer)
-        chat_ids = parse_chat_ids(self._config.chats)
+            handler = make_message_handler(
+                self._writer, self._entities_by_chat_id, self._topic_resolver
+            )
+        if chat_ids is None:
+            entries = parse_chat_entries(self._config.chats)
+            if entries.has_titles:
+                raise ConfigError(
+                    "Title-based chats require a connected client; use start()."
+                )
+            chat_ids = entries.ids
+        chat_ids = tuple(chat_ids)
         builder = new_message_builder(chat_ids)
         self._client.add_event_handler(handler, builder)
         self._registered = True
-        logger.info(
-            "Registered NewMessage handler for %d chat(s).", len(chat_ids)
-        )
+        logger.info("Registered NewMessage handler for %d chat(s).", len(chat_ids))
 
     async def start(self) -> None:
-        """Start the writer, connect, authorize if needed, and catch up."""
+        """Start the writer, connect, resolve config, and catch up.
+
+        Numeric-only configs keep the original order (register before connect) so
+        recovered updates are handled. When ``title:`` entries are present, the
+        client must connect first to resolve them from dialogs; registration then
+        happens after resolution but still before ``catch_up()``.
+        """
         if self._writer is not None:
             await self._writer.start()
-        if not self._registered:
-            self.register()
-        await self._client.start()
+
+        entries = parse_chat_entries(self._config.chats)
+        if entries.has_titles:
+            await self._client.start()
+            self._entities_by_chat_id.clear()
+            self._entities_by_chat_id.update(
+                await self._resolve_titles(entries.titles)
+            )
+            chat_ids = self._configured_chat_ids()
+            if not self._registered:
+                self.register(chat_ids=chat_ids)
+            await self._load_missing_entities(chat_ids)
+        else:
+            chat_ids = entries.ids
+            if not self._registered:
+                self.register(chat_ids=chat_ids)
+            await self._client.start()
+            await self._load_missing_entities(chat_ids)
+
         # Telethon docs: call catch_up() only after event handlers are
         # registered, so the fetched updates can be processed by our handler.
         await self._client.catch_up()
@@ -240,8 +395,15 @@ class TelegramRunner:
 
     async def sync_history(self):
         """Run bounded history reconciliation for the configured chats."""
-        chat_ids = parse_chat_ids(self._config.chats)
-        return await sync_history(self._client, chat_ids, self._store, self._writer)
+        chat_ids = self._configured_chat_ids()
+        return await sync_history(
+            self._client,
+            chat_ids,
+            self._store,
+            self._writer,
+            entities_by_chat_id=self._entities_by_chat_id,
+            topic_resolver=self._topic_resolver,
+        )
 
     async def run_forever(self) -> None:
         """Register, connect, recover, then wait until disconnected."""

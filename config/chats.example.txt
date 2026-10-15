@@ -1,11 +1,21 @@
-# Example chat list. Copy this file to "config/chats.txt" and add real IDs.
+# Example chat list. Copy this file to "config/chats.txt" and add real values.
 #
 # One identifier per line. Blank lines and lines starting with "#" are ignored.
 # Real identifiers must NOT be committed; "config/chats.txt" is git-ignored.
 #
-# Prefer numeric IDs (for example -1001234567890) over usernames.
+# Two forms are supported and may be mixed:
+#
+#   1) Numeric chat id (preferred, unambiguous), for example:
+#        -1001234567890
+#
+#   2) Exact supergroup title, prefixed with "title:", for example:
+#        title:My Courier Community
+#      The title is matched exactly (whitespace collapsed, case-insensitive)
+#      against the dialogs visible to the account. No fuzzy matching. If several
+#      chats share the title, or none match, the app stops and asks for a numeric
+#      id. The matched chat must be a forum supergroup with topics enabled.
 #
 # Examples (placeholders, replace with real values):
 # -1001234567890
 # -1009876543210
-# @example_public_group
+# title:Example Courier Community

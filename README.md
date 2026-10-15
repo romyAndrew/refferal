@@ -4,16 +4,20 @@ A local tool that (in later stages) will monitor selected Telegram chats via
 the official MTProto API (Telethon) and store new messages locally so they can
 be reviewed for courier-job interest.
 
-**Current status: stages 3–5 — SQLite storage, deduplication, pipeline
-robustness, and bounded startup history reconciliation.**
+**Current status: stages 3–7 — SQLite storage, deduplication, pipeline
+robustness, bounded startup history reconciliation, and forum-topic support.**
 New incoming text messages are persisted to SQLite through a bounded queue with
 a single writer; repeated delivery of the same `(chat_id, message_id)` is
 ignored. Messages without text or a caption are skipped. On startup the client
-also reconciles recent history for each configured chat to close gaps left while
-it was offline. Writer failures, DB-write errors, backpressure, lifecycle, and
-reconciliation are covered by offline integration tests against temporary
-databases. No live checks are run here: a **real Telegram connection is not run
-by the test suite**. The message text is never written to the logs.
+reconciles recent history for each configured chat to close gaps left while it
+was offline. Chats can be configured by numeric id or by an exact supergroup
+title (`title:`), and messages from forum supergroups store the topic id/title,
+sender information and (when reliably derivable) the message link and a content
+protection flag. Writer failures, DB-write errors, backpressure, lifecycle,
+reconciliation and topic resolution are covered by offline integration tests
+against temporary databases. No live checks are run here: a **real Telegram
+connection is not run by the test suite**. The message text is never written to
+the logs.
 
 ## Requirements
 
@@ -35,6 +39,7 @@ src/referral_finder/
   storage.py           SQLite store for messages + deduplication + checkpoints
   ingest.py            bounded queue + single writer pipeline
   history.py           bounded startup history reconciliation
+  topics.py            forum topic title resolution and caching
   telegram_client.py   Telethon client, incoming handler, lifecycle
 tests/unit/        unit + integration tests (no Telegram, no network)
 ```
@@ -46,6 +51,23 @@ Writes use `INSERT ... ON CONFLICT(chat_id, message_id) DO NOTHING`, so a
 message delivered twice is stored once and its original row is not overwritten.
 `date_utc` comes from the Telegram message and `received_at_utc` is set by the
 application when the event is handled; both are Unix timestamps in UTC.
+
+Additional nullable columns store the forum topic (`topic_id`, `topic_title`),
+the author (`sender_id`, `sender_username`, `sender_first_name`,
+`sender_last_name`, `sender_display_name`), `message_url` and `is_protected`
+(`1`/`0`, `NULL` when unknown). For non-forum chats these stay `NULL`. Existing
+databases are migrated in place with `ALTER TABLE ADD COLUMN` (no data loss, the
+primary key is unchanged). On a repeated message only currently-`NULL` metadata
+is filled in; existing non-NULL values, the text and the timestamps are never
+overwritten. Old rows keep `NULL` metadata until they are re-processed.
+
+`sender_id` is the primary author identifier. For channel/anonymous senders no
+user names are invented (the real channel title or `post_author` may be used as
+a display name). `message_url` is only produced when it can be derived reliably
+(public username links or the documented `t.me/c/` form for private
+channels/supergroups). The protection flag combines message- and chat-level
+`noforwards`, so a single message without the flag is never treated as proof that
+the chat is unprotected.
 
 The inbound handler queues text messages into a bounded `asyncio.Queue`
 (default size 1000) drained by a single background writer, so only one
@@ -128,10 +150,20 @@ Variables:
 
 ### Chat list
 
-Copy `config/chats.example.txt` to `config/chats.txt` and add one chat
-identifier per line (numeric IDs preferred). Blank lines and `#` comments are
-ignored. The real `config/chats.txt` is git-ignored; only the example is
-tracked.
+Copy `config/chats.example.txt` to `config/chats.txt` and add one identifier per
+line. Blank lines and `#` comments are ignored. The real `config/chats.txt` is
+git-ignored; only the example is tracked. Two forms are supported:
+
+- **Numeric id** (recommended), e.g. `-1001234567890`.
+- **Exact supergroup title**, prefixed with `title:`, e.g.
+  `title:My Courier Community`. The title is matched exactly (after collapsing
+  whitespace and case-folding) against the dialogs visible to the account. No
+  fuzzy matching: if there is no match, or several chats share the title, the app
+  stops with a clear error and asks for a numeric id. The matched chat must be a
+  forum supergroup with topics enabled.
+
+Both forms may be mixed in one file. Title resolution needs a connected client,
+so it happens right after connecting and before `catch_up()`.
 
 ## Run
 
@@ -143,11 +175,13 @@ Without required settings the command exits with a clear message and a non-zero
 code (it does not print a traceback).
 
 With a valid `.env` and a non-empty `config/chats.txt`, the command opens the
-SQLite database at `DB_PATH`, starts the Telethon client, registers the
-incoming-message handler, runs the standard recovery (`client.catch_up()`),
-reconciles recent history for each configured chat, and waits until
-disconnected. New text messages are written to SQLite; repeated delivery of the
-same message is ignored.
+SQLite database at `DB_PATH`, starts the Telethon client, resolves any
+`title:` entries (for those, it connects first), registers the incoming-message
+handler, runs the standard recovery (`client.catch_up()`), reconciles recent
+history for each configured chat, and waits until disconnected. New text
+messages are written to SQLite; repeated delivery of the same message is
+ignored. Forum supergroups are subscribed by parent chat id (all topics at
+once), and each message keeps its topic id/title.
 
 The database (and its parent directory) is created only when the command runs,
 i.e. only with a configured `DB_PATH`. Set `DB_PATH` to a path **outside the
@@ -159,8 +193,9 @@ net).
 > first use. That live check is performed separately, after explicit approval.
 > First-time login is interactive; subsequent runs reuse the session file.
 
-The handler logs only `chat_id`, `message_id`, `date_utc`, and `text_length`.
-It never logs the message text.
+The handler logs only technical identifiers (`chat_id`, `message_id`,
+`date_utc`, `text_length`, `topic_id`, and whether the topic title is known). It
+never logs the message text.
 
 ## Tests
 

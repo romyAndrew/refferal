@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Iterable, List, Optional
 
 from .ingest import MessageWriter
-from .models import incoming_from_object
+from .models import build_incoming
 from .storage import MessageStore
 
 logger = logging.getLogger(__name__)
@@ -74,13 +74,18 @@ async def sync_history(
     initial_limit: int = DEFAULT_INITIAL_HISTORY_LIMIT,
     page_size: int = DEFAULT_HISTORY_PAGE_SIZE,
     clock: Callable[[], float] = time.time,
+    entities_by_chat_id=None,
+    topic_resolver=None,
 ) -> List[ChatSyncResult]:
     """Reconcile each configured chat and return per-chat results.
 
     ``client`` only needs an async ``iter_messages(entity, ...)`` method (the
     real :class:`telethon.TelegramClient` and the test fakes both provide it).
+    ``entities_by_chat_id`` and ``topic_resolver`` are optional and enrich
+    forum metadata using the same rules as the live handler.
     """
     ids = [int(chat_id) for chat_id in chat_ids]
+    entities_by_chat_id = entities_by_chat_id or {}
     logger.info("History sync starting for %d chat(s).", len(ids))
     results: List[ChatSyncResult] = []
     for chat_id in ids:
@@ -93,6 +98,8 @@ async def sync_history(
                 initial_limit=initial_limit,
                 page_size=page_size,
                 clock=clock,
+                entities_by_chat_id=entities_by_chat_id,
+                topic_resolver=topic_resolver,
             )
         )
     return results
@@ -107,9 +114,12 @@ async def _sync_one_chat(
     initial_limit: int,
     page_size: int,
     clock: Callable[[], float],
+    entities_by_chat_id=None,
+    topic_resolver=None,
 ) -> ChatSyncResult:
     checkpoint_before = store.get_checkpoint(chat_id)
     initial = checkpoint_before is None
+    chat_entity = (entities_by_chat_id or {}).get(chat_id)
 
     errors_before = writer.errors
     saved_before = writer.saved
@@ -132,7 +142,12 @@ async def _sync_one_chat(
                 if getattr(message, "out", False):
                     skipped += 1
                     continue
-                incoming = incoming_from_object(message, received_at_utc=int(clock()))
+                incoming = await build_incoming(
+                    message,
+                    received_at_utc=int(clock()),
+                    chat_entity=chat_entity,
+                    topic_resolver=topic_resolver,
+                )
                 if incoming.text is None:
                     skipped += 1
                     continue

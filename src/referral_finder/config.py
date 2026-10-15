@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Iterable, Mapping, Optional, Tuple
 
 try:  # python-dotenv is a declared dependency; guard keeps imports robust.
     from dotenv import load_dotenv
@@ -27,9 +27,56 @@ DEFAULT_LOG_LEVEL = "INFO"
 
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
+TITLE_PREFIX = "title:"
+
 
 class ConfigError(Exception):
     """Raised when required configuration is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class ChatEntries:
+    """Configured chats split into numeric ids and exact-title entries."""
+
+    ids: Tuple[int, ...]
+    titles: Tuple[str, ...]
+
+    @property
+    def has_titles(self) -> bool:
+        return bool(self.titles)
+
+
+def parse_chat_entries(chats: Iterable[str]) -> ChatEntries:
+    """Parse ``config/chats.txt`` entries.
+
+    Each entry is either a numeric chat id or ``title:<exact supergroup name>``.
+    Non-numeric entries without the ``title:`` prefix are rejected.
+    """
+    ids = []
+    titles = []
+    for raw in chats:
+        entry = raw.strip()
+        if not entry:
+            raise ConfigError(
+                "Invalid chat entry in config/chats.txt: empty line "
+                "(numeric ID or 'title:Name' expected)"
+            )
+        if entry.lower().startswith(TITLE_PREFIX):
+            title = entry[len(TITLE_PREFIX):].strip()
+            if not title:
+                raise ConfigError(
+                    "Invalid chat entry in config/chats.txt: 'title:' without a name"
+                )
+            titles.append(title)
+        else:
+            try:
+                ids.append(int(entry))
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(
+                    f"Invalid chat id in config/chats.txt: {raw!r} "
+                    "(numeric ID or 'title:Name' expected)"
+                ) from exc
+    return ChatEntries(ids=tuple(ids), titles=tuple(titles))
 
 
 @dataclass(frozen=True)
