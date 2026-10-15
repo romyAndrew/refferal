@@ -17,6 +17,13 @@ from .base import (
     LLMTimeoutError,
 )
 from .fake import FakeProvider
+from .deepseek import (
+    DeepSeekProvider,
+    HttpRequest,
+    HttpResponse,
+    HttpTransport,
+    UrllibHttpTransport,
+)
 from .prompt import PROMPT_HASH, PROMPT_VERSION, build_messages
 from .schema import (
     STATUS_ERROR,
@@ -34,7 +41,11 @@ from .schema import (
 
 __all__ = [
     "AnalysisResult",
+    "DeepSeekProvider",
     "FakeProvider",
+    "HttpRequest",
+    "HttpResponse",
+    "HttpTransport",
     "LLMConfigError",
     "LLMError",
     "LLMProvider",
@@ -51,6 +62,7 @@ __all__ = [
     "STATUS_OK",
     "STATUS_REFUSED",
     "STATUSES",
+    "UrllibHttpTransport",
     "ValidationError",
     "ai_analysis_row",
     "build_messages",

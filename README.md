@@ -159,6 +159,25 @@ Online classification is **off by default**:
 |---|---|---|
 | `CLASSIFY_ON_INGEST` | no | `true`/`1`/`on` to classify each successfully saved message (default `false`) |
 
+**AI classification (offline preparation).** A provider-agnostic LLM layer is
+scaffolded but not wired into the collector and performs **no** network calls.
+The intended flow is: `prefilter` → best-effort `scrubbing` → provider. The
+DeepSeek adapter is prepared with an injectable HTTP transport and is covered by
+offline tests only. Online calls stay off until explicitly enabled:
+
+| Variable | Required | Description |
+|---|---|---|
+| `LLM_ENABLED` | no | enable AI calls (default `false`; nothing calls out yet) |
+| `LLM_PROVIDER` | no | provider key (default `deepseek`) |
+| `LLM_MODEL` | no | model id (default `deepseek-flash`) |
+| `LLM_BASE_URL` | no | API base URL (default `https://api.deepseek.com`) |
+| `LLM_API_KEY` | no | API key from the environment only; never logged |
+| `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | no | request timeout / bounded retries |
+| `LLM_MAX_INPUT_CHARS` / `LLM_MAX_OUTPUT_TOKENS` | no | input/output bounds |
+
+Scrubbing is best-effort and does **not** guarantee anonymization (names and
+other sensitive content may remain). See `SPEC.md` SEC-5.1–SEC-5.7.
+
 When enabled, classification runs as a post-persist hook inside the single
 writer; a classifier error is logged and does **not** stop collection. Backfill
 existing rows without Telegram:
