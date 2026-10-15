@@ -55,6 +55,8 @@ def test_live_with_injected_provider_sends_scrubbed_message_only():
     assert "status=ok" in text
     assert "category=job_interest" in text
     assert "relevant=True" in text
+    assert "requests_planned=1" in text
+    assert "requests=1" in text
     # Never print the raw request or the message body.
     assert SMOKE_MESSAGE not in text
 
@@ -69,4 +71,25 @@ def test_live_summary_shows_model_version_and_request_count():
     text = out.getvalue()
     assert "model=fake-model" in text
     assert "criteria_version=" in text
+    assert "requests_planned=1" in text
     assert "requests=1" in text
+
+
+def test_prefilter_rejection_skips_provider(monkeypatch):
+    import referral_finder.llm.smoke as smoke_module
+    from referral_finder.prefilter import PrefilterResult
+
+    monkeypatch.setattr(smoke_module, "prefilter", lambda text: PrefilterResult(False, ()))
+    provider = FakeProvider(
+        handler=lambda request: AnalysisResult(JOB_INTEREST, True, 0.9, "ok")
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = run(["--live"], env={}, provider=provider)
+
+    assert rc == 1
+    assert provider.calls == []  # provider was never called
+    text = out.getvalue()
+    assert "status=prefilter_skipped" in text
+    assert "requests=0" in text
+    assert "requests=1" not in text

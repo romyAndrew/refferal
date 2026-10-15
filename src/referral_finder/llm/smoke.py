@@ -11,9 +11,11 @@ Safety properties:
   secret filter; it is never printed or placed in exceptions.
 * The message still flows through ``scrub`` before the provider sees it, and no
   Telegram identifiers/links/metadata are attached.
-* The summary shows the model, criteria version and request count (1); the result
-  prints only the validated category, relevance, status and usage. The full
-  request and raw provider response are never printed.
+* The summary shows the model, criteria version and the *planned* request count
+  (``requests_planned=1``); ``requests=1`` is only printed once the provider call
+  has actually completed (success or handled error). The result prints only the
+  validated category, relevance, status and usage. The full request and raw
+  provider response are never printed.
 """
 
 from __future__ import annotations
@@ -107,11 +109,14 @@ def run(
         provider = _build_live_provider(env, model, transport)
 
     version = effective_analysis_version(provider.prompt_version, args.criteria)
-    print(f"live=1 model={provider.model} criteria_version={version} requests=1")
+    print(
+        f"live=1 model={provider.model} criteria_version={version} "
+        "requests_planned=1"
+    )
 
     gate = prefilter(SMOKE_MESSAGE)
     if not gate.matched:
-        print("status=prefilter_skipped")
+        print("status=prefilter_skipped requests=0")
         return 1
     cleaned = scrub(SMOKE_MESSAGE)
     request = LLMRequest(text=cleaned.text, criteria=args.criteria)
@@ -119,15 +124,17 @@ def run(
     try:
         result = asyncio.run(provider.analyze(request))
     except LLMError as exc:
-        # Only the error type, never the key or the request/response body.
-        print(f"status=error error={type(exc).__name__}")
+        # Only the error type, never the key or the request/response body. The
+        # call was attempted, so it is counted, but the error status makes it
+        # clear that no successful response was obtained.
+        print(f"status=error error={type(exc).__name__} requests=1")
         return 1
     except Exception as exc:  # noqa: BLE001 - report type only, no details
-        print(f"status=error error={type(exc).__name__}")
+        print(f"status=error error={type(exc).__name__} requests=1")
         return 1
 
     print(
-        f"status=ok category={result.category} relevant={result.relevant}"
+        f"status=ok category={result.category} relevant={result.relevant} requests=1"
     )
     usage = getattr(provider, "last_usage", None)
     if usage is not None:

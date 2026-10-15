@@ -319,3 +319,62 @@ async def test_temporary_failure_is_retried(tmp_path):
         stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(good))
         assert stored["status"] == "ok"
         assert stored["attempts"] == 2
+
+
+class _OtherProvider(FakeProvider):
+    """FakeProvider reporting a different provider name."""
+
+    provider_name = "other"
+
+
+async def test_same_message_different_model_stores_separate_results(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        m1 = FakeProvider(
+            handler=lambda r: AnalysisResult(JOB_INTEREST, True, 0.9, "m1"),
+            model="model-a",
+        )
+        m2 = FakeProvider(
+            handler=lambda r: AnalysisResult(UNCERTAIN, None, 0.1, "m2"),
+            model="model-b",
+        )
+        s1 = MessageAnalysisService(store, m1, enabled=True, criteria="курьер")
+        s2 = MessageAnalysisService(store, m2, enabled=True, criteria="курьер")
+
+        assert (await s1.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+        # The model-a success must not satisfy the model-b identity.
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "model-b", eff(m2, "курьер")
+        ) is None
+        assert (await s2.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+
+        count = store._conn.execute("SELECT COUNT(*) FROM message_ai_analysis").fetchone()[0]
+        assert count == 2
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "model-a", eff(m1, "курьер")
+        )["status"] == "ok"
+        assert store.get_ai_analysis(
+            CHAT, 1, "fake", "model-b", eff(m2, "курьер")
+        )["status"] == "ok"
+        # Both providers were actually invoked; the result was not reused.
+        assert len(m1.calls) == 1 and len(m2.calls) == 1
+
+
+async def test_same_message_different_provider_stores_separate_results(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        p1 = FakeProvider(handler=lambda r: AnalysisResult(JOB_INTEREST, True, 0.9, "p1"))
+        p2 = _OtherProvider(handler=lambda r: AnalysisResult(JOB_INTEREST, True, 0.9, "p2"))
+        s1 = MessageAnalysisService(store, p1, enabled=True, criteria="курьер")
+        s2 = MessageAnalysisService(store, p2, enabled=True, criteria="курьер")
+
+        assert (await s1.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+        # The "fake" provider success must not satisfy the "other" provider.
+        assert store.get_ai_analysis(
+            CHAT, 1, "other", "fake-model", eff(p2, "курьер")
+        ) is None
+        assert (await s2.analyze(CHAT, 1, MATCHING)).status == STATUS_SAVED
+
+        count = store._conn.execute("SELECT COUNT(*) FROM message_ai_analysis").fetchone()[0]
+        assert count == 2
+        assert len(p2.calls) == 1
