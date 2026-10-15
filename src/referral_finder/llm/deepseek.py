@@ -113,6 +113,7 @@ class DeepSeekProvider:
         max_input_chars: int = 4000,
         max_output_tokens: int = 400,
         temperature: float = 0.0,
+        thinking_type: str = "disabled",
         backoff_seconds: float = 0.5,
         sleep: Optional[Callable[[float], "asyncio.Future"]] = None,
     ):
@@ -128,10 +129,15 @@ class DeepSeekProvider:
         self._max_input_chars = max_input_chars
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
+        # Classification does not need chain-of-thought; DeepSeek defaults to
+        # thinking mode, so it is disabled explicitly.
+        self._thinking_type = thinking_type
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep or asyncio.sleep
         self.prompt_version = PROMPT_VERSION
         self.prompt_hash = PROMPT_HASH
+        # Token usage of the most recent successful call (safe to display).
+        self.last_usage: Optional[dict] = None
 
     async def analyze(self, request: LLMRequest) -> AnalysisResult:
         bounded = LLMRequest(
@@ -170,7 +176,9 @@ class DeepSeekProvider:
             if not 200 <= response.status < 300:
                 raise LLMResponseError(f"unexpected provider status ({response.status})")
 
-            return self._parse_response(response.body)
+            result, usage = self._parse_response(response.body)
+            self.last_usage = usage
+            return result
 
         # Unreachable: the loop either returns or raises. Kept for clarity.
         raise last_error or LLMError("provider analysis failed")
@@ -186,6 +194,7 @@ class DeepSeekProvider:
             "max_tokens": self._max_output_tokens,
             "stream": False,
             "response_format": {"type": "json_object"},
+            "thinking": {"type": self._thinking_type},
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = (
@@ -200,7 +209,7 @@ class DeepSeekProvider:
         )
 
     @staticmethod
-    def _parse_response(body: bytes) -> AnalysisResult:
+    def _parse_response(body: bytes) -> Tuple[AnalysisResult, Optional[dict]]:
         try:
             data = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -217,6 +226,11 @@ class DeepSeekProvider:
             raise LLMResponseError("model content is not valid JSON") from exc
 
         try:
-            return validate_analysis(payload)
+            result = validate_analysis(payload)
         except ValidationError as exc:
             raise LLMResponseError(f"model content failed validation: {exc}") from exc
+
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            usage = None
+        return result, usage

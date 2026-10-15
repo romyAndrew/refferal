@@ -16,6 +16,7 @@ from .base import (
     LLMServerError,
     LLMTimeoutError,
 )
+from .factory import DEEPSEEK_API_KEY_ENV, provider_from_config
 from .fake import FakeProvider
 from .deepseek import (
     DeepSeekProvider,
@@ -51,6 +52,7 @@ from .schema import (
 __all__ = [
     "AnalysisOutcome",
     "AnalysisResult",
+    "DEEPSEEK_API_KEY_ENV",
     "DeepSeekProvider",
     "FakeProvider",
     "HttpRequest",
@@ -83,5 +85,6 @@ __all__ = [
     "ai_analysis_row",
     "build_messages",
     "expected_relevant",
+    "provider_from_config",
     "validate_analysis",
 ]

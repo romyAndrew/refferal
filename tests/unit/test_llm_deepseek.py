@@ -194,3 +194,31 @@ async def test_api_key_is_not_placed_in_the_body():
     transport = FakeTransport([chat_response(analysis_content())])
     await provider(transport).analyze(LLMRequest(text="x"))
     assert API_KEY not in transport.requests[0].body.decode("utf-8")
+
+
+async def test_thinking_mode_is_disabled_in_request():
+    transport = FakeTransport([chat_response(analysis_content())])
+    await provider(transport).analyze(LLMRequest(text="x"))
+    payload = json.loads(transport.requests[0].body)
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+async def test_usage_is_captured_when_present():
+    body = json.dumps(
+        {
+            "choices": [{"message": {"content": analysis_content()}}],
+            "usage": {"prompt_tokens": 16, "completion_tokens": 10, "total_tokens": 26},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    transport = FakeTransport([HttpResponse(200, body)])
+    p = provider(transport)
+    await p.analyze(LLMRequest(text="x"))
+    assert p.last_usage == {"prompt_tokens": 16, "completion_tokens": 10, "total_tokens": 26}
+
+
+async def test_usage_is_none_when_absent():
+    transport = FakeTransport([chat_response(analysis_content())])
+    p = provider(transport)
+    await p.analyze(LLMRequest(text="x"))
+    assert p.last_usage is None

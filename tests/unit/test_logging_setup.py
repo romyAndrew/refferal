@@ -7,7 +7,7 @@ import contextlib
 import io
 import logging
 
-from referral_finder.logging_setup import SecretFilter, setup_logging
+from referral_finder.logging_setup import SecretFilter, register_secret, setup_logging
 
 
 def _make_record(msg, args=()):
@@ -50,4 +50,38 @@ def test_setup_logging_masks_secret_on_stderr():
 
     output = buffer.getvalue()
     assert "S3CR3T" not in output
+    assert "***" in output
+
+
+def test_register_secret_after_setup_masks_future_records():
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buffer):
+            setup_logging(level="INFO", secrets=[])
+            register_secret("AFTERKEY")
+            logging.getLogger("unit.after").info("value AFTERKEY here")
+    finally:
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+    output = buffer.getvalue()
+    assert "AFTERKEY" not in output
+    assert "***" in output
+
+
+def test_register_secret_before_setup_is_merged():
+    buffer = io.StringIO()
+    register_secret("BEFOREKEY")
+    try:
+        with contextlib.redirect_stderr(buffer):
+            setup_logging(level="INFO", secrets=[])
+            logging.getLogger("unit.before").info("value BEFOREKEY here")
+    finally:
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+    output = buffer.getvalue()
+    assert "BEFOREKEY" not in output
     assert "***" in output
