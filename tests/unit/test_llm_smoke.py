@@ -2,10 +2,14 @@
 
 import contextlib
 import io
+import json
+import logging
 
 from referral_finder.classifier import JOB_INTEREST
-from referral_finder.llm import AnalysisResult, FakeProvider, LLMRequest
+from referral_finder.llm import AnalysisResult, FakeProvider, HttpResponse, LLMRequest
+from referral_finder.llm.factory import DEEPSEEK_API_KEY_ENV
 from referral_finder.llm.smoke import SMOKE_MESSAGE, run
+from referral_finder.logging_setup import setup_logging
 from referral_finder.scrubbing import scrub
 
 
@@ -93,3 +97,75 @@ def test_prefilter_rejection_skips_provider(monkeypatch):
     assert "status=prefilter_skipped" in text
     assert "requests=0" in text
     assert "requests=1" not in text
+
+
+class FakeTransport:
+    """Captures the HTTP request; returns a canned response. No network."""
+
+    def __init__(self, response):
+        self._response = response
+        self.requests = []
+
+    async def send(self, request):
+        self.requests.append(request)
+        return self._response
+
+
+def _chat_response(content, usage=None):
+    payload = {"choices": [{"message": {"content": content}}]}
+    if usage is not None:
+        payload["usage"] = usage
+    return HttpResponse(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def test_live_path_uses_real_provider_and_sends_no_metadata():
+    content = json.dumps(
+        {
+            "category": "job_interest",
+            "relevant": True,
+            "confidence": 0.8,
+            "explanation": "ok",
+        },
+        ensure_ascii=False,
+    )
+    transport = FakeTransport(_chat_response(content, {"total_tokens": 42}))
+    env = {"LLM_ENABLED": "true", DEEPSEEK_API_KEY_ENV: "SMOKEKEY123"}
+
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            setup_logging(level="INFO", secrets=[])
+            rc = run(["--live"], env=env, transport=transport)
+            logging.getLogger("unit.smoke").info("using key SMOKEKEY123 now")
+    finally:
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+    assert rc == 0
+    assert len(transport.requests) == 1
+    request = transport.requests[0]
+    assert request.url == "https://api.deepseek.com/chat/completions"
+
+    body = json.loads(request.body)
+    assert body["model"] == "deepseek-flash"
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["max_tokens"] == 200
+    user_content = body["messages"][1]["content"]
+    assert scrub(SMOKE_MESSAGE).text in user_content
+
+    body_text = request.body.decode("utf-8")
+    assert "SMOKEKEY123" not in body_text  # the key never goes into the body
+    for leaked in ("chat_id", "sender_id", "message_id", "topic_id", "t.me", "@"):
+        assert leaked not in body_text
+
+    text = out.getvalue()
+    assert "status=ok" in text
+    assert "category=job_interest" in text
+    assert "usage=" in text
+    assert SMOKE_MESSAGE not in text  # raw message never printed
+
+    # The API key is masked before any use.
+    assert "SMOKEKEY123" not in err.getvalue()
+    assert "***" in err.getvalue()

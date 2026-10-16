@@ -2,6 +2,8 @@
 
 import logging
 
+import pytest
+
 from referral_finder.classifier import IRRELEVANT, JOB_INTEREST, UNCERTAIN
 from referral_finder.llm import (
     STATUS_DISABLED,
@@ -11,8 +13,11 @@ from referral_finder.llm import (
     STATUS_STORAGE_ERROR,
     AnalysisResult,
     FakeProvider,
+    LLMRateLimitError,
     LLMRequest,
     LLMResponseError,
+    LLMServerError,
+    LLMTimeoutError,
     MessageAnalysisService,
 )
 from referral_finder.llm.deepseek import DeepSeekProvider, HttpResponse
@@ -378,3 +383,31 @@ async def test_same_message_different_provider_stores_separate_results(tmp_path)
         count = store._conn.execute("SELECT COUNT(*) FROM message_ai_analysis").fetchone()[0]
         assert count == 2
         assert len(p2.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error, expected_code",
+    [
+        (LLMTimeoutError("t"), "timeout"),
+        (LLMRateLimitError("r"), "rate_limit"),
+        (LLMServerError("s"), "server_error"),
+    ],
+)
+async def test_transient_provider_errors_are_recorded_as_failures(
+    tmp_path, error, expected_code
+):
+    with MessageStore(tmp_path / "m.db") as store:
+        seed(store, 1, MATCHING)
+        provider = FakeProvider(handler=lambda request: error)
+        service = MessageAnalysisService(store, provider, enabled=True)
+
+        outcome = await service.analyze(CHAT, 1, MATCHING)
+
+        assert outcome.status == "error"
+        assert outcome.error == expected_code
+        stored = store.get_ai_analysis(CHAT, 1, "fake", "fake-model", eff(provider))
+        assert stored["status"] == "error"
+        assert stored["error"] == expected_code
+        assert stored["category"] is None  # never stored as a success
+        # The source message is untouched and stays retryable.
+        assert store.fetch(CHAT, 1)[4] == MATCHING
