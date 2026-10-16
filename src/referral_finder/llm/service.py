@@ -13,12 +13,13 @@ collector.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-from ..prefilter import prefilter
+from ..prefilter import PREFILTER_VERSION, prefilter
 from ..scrubbing import scrub
 from ..storage import MessageStore
 from .base import (
@@ -107,6 +108,7 @@ class MessageAnalysisService:
             return AnalysisOutcome(STATUS_DUPLICATE, matched=True)
 
         gate = prefilter(text)
+        self._record_prefilter(chat_id, message_id, gate)
         if not gate.matched:
             return AnalysisOutcome(
                 STATUS_PREFILTER_SKIPPED,
@@ -207,6 +209,25 @@ class MessageAnalysisService:
             self._effective_version(),
         )
         return stored is not None and stored.get("status") == STATUS_OK
+
+    def _record_prefilter(self, chat_id: int, message_id: int, gate) -> None:
+        """Persist the prefilter decision (best-effort, no text or ids logged).
+
+        Recording it lets the selection skip rejected messages instead of
+        re-reading them every cycle. Bumping ``PREFILTER_VERSION`` re-checks.
+        """
+        row = (
+            int(chat_id),
+            int(message_id),
+            PREFILTER_VERSION,
+            int(gate.matched),
+            json.dumps(list(gate.rule_ids)),
+            int(self._clock()),
+        )
+        try:
+            self._store.save_prefilter_results([row])
+        except Exception:
+            logger.exception("Failed to store prefilter decision")
 
     def _store_ok(
         self,

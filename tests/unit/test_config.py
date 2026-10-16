@@ -140,3 +140,57 @@ def test_safe_repr_hides_llm_key(tmp_path):
     text = config.safe_repr()
     assert "SUPERSECRETLLMKEY" not in text
     assert "llm_model='deepseek-flash'" in text
+
+
+def test_llm_worker_defaults(tmp_path):
+    config = load_config(make_env(), chats_file=tmp_path / "chats.txt")
+    assert config.llm_criteria == ""
+    assert config.llm_poll_interval == 5.0
+    assert config.llm_batch_size == 25
+    assert config.llm_max_attempts == 3
+
+
+def test_llm_worker_settings_from_env(tmp_path):
+    config = load_config(
+        make_env(
+            LLM_CRITERIA="курьер, доставка",
+            LLM_POLL_INTERVAL="1.5",
+            LLM_BATCH_SIZE="10",
+            LLM_MAX_ATTEMPTS="5",
+        ),
+        chats_file=tmp_path / "chats.txt",
+    )
+    assert config.llm_criteria == "курьер, доставка"
+    assert config.llm_poll_interval == 1.5
+    assert config.llm_batch_size == 10
+    assert config.llm_max_attempts == 5
+
+
+def test_llm_worker_invalid_values_raise(tmp_path):
+    chats = tmp_path / "chats.txt"
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_POLL_INTERVAL="0"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_POLL_INTERVAL="-1"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_POLL_INTERVAL="nope"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_BATCH_SIZE="0"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_MAX_ATTEMPTS="0"), chats_file=chats)
+    with pytest.raises(ConfigError):
+        load_config(make_env(LLM_BATCH_SIZE="many"), chats_file=chats)
+
+
+def test_missing_worker_vars_keep_old_config(tmp_path):
+    # An environment without any of the new variables still loads fine.
+    env = {
+        "TG_API_ID": "123456",
+        "TG_API_HASH": "fake_api_hash_value",
+        "TG_SESSION_PATH": "C:/secrets/referral.session",
+    }
+    config = load_config(env, chats_file=tmp_path / "chats.txt")
+    assert config.llm_criteria == ""
+    assert config.llm_poll_interval == 5.0
+    assert config.llm_batch_size == 25
+    assert config.llm_max_attempts == 3

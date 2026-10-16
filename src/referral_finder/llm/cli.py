@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from ..prefilter import PREFILTER_VERSION
 from ..storage import DEFAULT_MAX_ATTEMPTS, MessageStore
 from .fake import FakeProvider
 from .service import (
@@ -89,7 +90,11 @@ async def _run_pipeline(store, provider, enabled, criteria, limit, max_attempts)
     version = effective_analysis_version(provider.prompt_version, criteria)
     counts = _empty_counts()
     for batch in store.iter_ai_unprocessed(
-        provider.provider_name, provider.model, version, max_attempts=max_attempts
+        provider.provider_name,
+        provider.model,
+        version,
+        max_attempts=max_attempts,
+        prefilter_version=PREFILTER_VERSION,
     ):
         for chat_id, message_id, text in batch:
             if limit is not None and counts["checked"] >= limit:
@@ -145,6 +150,7 @@ def run(
                 provider.model,
                 version,
                 max_attempts=args.max_attempts,
+                prefilter_version=PREFILTER_VERSION,
             )
             print(
                 f"dry_run=1 pending={pending} version={version}"

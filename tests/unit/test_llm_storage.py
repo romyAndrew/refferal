@@ -5,6 +5,7 @@ import sqlite3
 from referral_finder.classifier import JOB_INTEREST, UNCERTAIN
 from referral_finder.llm import AnalysisResult, ai_analysis_row
 from referral_finder.models import IncomingMessage
+from referral_finder.prefilter import PREFILTER_VERSION
 from referral_finder.storage import MessageStore
 
 PROVIDER = "deepseek"
@@ -22,6 +23,10 @@ def make_message(message_id, text="hello"):
         text=text,
         sender_id=7,
     )
+
+
+def pf_row(message_id, version, matched, rules="[]", ts=1):
+    return (-1, message_id, version, int(matched), rules, ts)
 
 
 def row(message_id, result, *, version=PROMPT_VERSION, status="ok", error=None):
@@ -209,3 +214,77 @@ def test_migration_adds_attempts_to_existing_ai_table(tmp_path):
         stored = store.get_ai_analysis(-1, 5, "deepseek", "deepseek-flash", "v1")
         assert stored["status"] == "ok"  # existing row preserved
         assert stored["attempts"] == 0  # backfilled default
+
+
+# --- prefilter decisions ---------------------------------------------------
+
+
+def test_prefilter_results_are_idempotent_per_version(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        assert store.save_prefilter_results([pf_row(1, "pf1", 0)]) == 1
+        assert store.save_prefilter_results([pf_row(1, "pf1", 1)]) == 0  # kept
+        stored = store.get_prefilter_result(-1, 1, "pf1")
+        assert stored["matched"] is False
+        # A different version is a separate decision (allows re-checking).
+        assert store.save_prefilter_results([pf_row(1, "pf2", 1)]) == 1
+        assert store.get_prefilter_result(-1, 1, "pf2")["matched"] is True
+
+
+def test_selection_skips_prefilter_rejected_for_version(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        for message_id in (1, 2, 3):
+            store.save(make_message(message_id))
+        store.save_prefilter_results(
+            [pf_row(1, "pf1", 0), pf_row(2, "pf1", 0), pf_row(3, "pf1", 1)]
+        )
+
+        def ids(version):
+            batches = list(
+                store.iter_ai_unprocessed(
+                    PROVIDER, MODEL, PROMPT_VERSION, prefilter_version=version
+                )
+            )
+            return sorted(mid for batch in batches for _, mid, _ in batch)
+
+        assert ids("pf1") == [3]  # rejected 1 and 2 are skipped
+        # Bumping the prefilter version re-checks everything.
+        assert ids("pf2") == [1, 2, 3]
+        # Empty version disables prefilter filtering (backward compatible).
+        assert ids("") == [1, 2, 3]
+
+
+def test_count_ai_unprocessed_respects_prefilter_version(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        for message_id in (1, 2):
+            store.save(make_message(message_id))
+        store.save_prefilter_results([pf_row(1, "pf1", 0)])
+        assert store.count_ai_unprocessed(
+            PROVIDER, MODEL, PROMPT_VERSION, prefilter_version="pf1"
+        ) == 1
+        assert store.count_ai_unprocessed(
+            PROVIDER, MODEL, PROMPT_VERSION, prefilter_version="pf2"
+        ) == 2
+
+
+def test_migration_creates_prefilter_table_on_existing_db(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+        "date_utc INTEGER NOT NULL, received_at_utc INTEGER NOT NULL, "
+        "text TEXT, sender_id INTEGER, PRIMARY KEY (chat_id, message_id))"
+    )
+    conn.execute("INSERT INTO messages VALUES (-1, 5, 1, 1, 'old text', 9)")
+    conn.commit()
+    conn.close()
+
+    with MessageStore(db_path) as store:
+        found = store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='message_prefilter'"
+        ).fetchone()
+        assert found == ("message_prefilter",)
+        assert store.count() == 1  # existing data preserved
+        assert store.save_prefilter_results([pf_row(5, PREFILTER_VERSION, 0)]) == 1

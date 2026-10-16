@@ -48,8 +48,10 @@ from .schema import (
     expected_relevant,
     validate_analysis,
 )
+from .worker import AiWorker
 
 __all__ = [
+    "AiWorker",
     "AnalysisOutcome",
     "AnalysisResult",
     "DEEPSEEK_API_KEY_ENV",

@@ -193,6 +193,43 @@ _AI_INDEX = (
     "ON message_ai_analysis(provider, model, prompt_version, category)"
 )
 
+# Prefilter decisions, stored separately from the AI result and from the source
+# message. Keyed by (chat_id, message_id, prefilter_version) so bumping
+# PREFILTER_VERSION re-checks every message while a decision stays idempotent
+# for a given version. ``matched=0`` lets the AI selection skip rejected
+# messages instead of re-reading them every cycle (no starvation).
+_PREFILTER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS message_prefilter (
+    chat_id            INTEGER NOT NULL,
+    message_id         INTEGER NOT NULL,
+    prefilter_version  TEXT    NOT NULL,
+    matched            INTEGER NOT NULL,
+    matched_rules      TEXT    NOT NULL DEFAULT '[]',
+    checked_at_utc     INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, prefilter_version),
+    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+)
+"""
+
+_PREFILTER_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_prefilter_version_matched "
+    "ON message_prefilter(prefilter_version, matched)"
+)
+
+_INSERT_PREFILTER = """
+INSERT INTO message_prefilter (
+    chat_id, message_id, prefilter_version, matched, matched_rules, checked_at_utc
+)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id, message_id, prefilter_version) DO NOTHING
+"""
+
+_SELECT_PREFILTER = """
+SELECT prefilter_version, matched, matched_rules, checked_at_utc
+FROM message_prefilter
+WHERE chat_id = ? AND message_id = ? AND prefilter_version = ?
+"""
+
 _INSERT_AI = """
 INSERT INTO message_ai_analysis (
     chat_id, message_id, provider, model, prompt_version, prompt_hash,
@@ -242,8 +279,13 @@ LEFT JOIN message_ai_analysis a
    AND a.provider = ?
    AND a.model = ?
    AND a.prompt_version = ?
+LEFT JOIN message_prefilter p
+    ON p.chat_id = m.chat_id
+   AND p.message_id = m.message_id
+   AND p.prefilter_version = ?
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+  AND (p.chat_id IS NULL OR p.matched = 1)
   AND (m.chat_id, m.message_id) > (?, ?)
 ORDER BY m.chat_id, m.message_id
 LIMIT ?
@@ -258,8 +300,13 @@ LEFT JOIN message_ai_analysis a
    AND a.provider = ?
    AND a.model = ?
    AND a.prompt_version = ?
+LEFT JOIN message_prefilter p
+    ON p.chat_id = m.chat_id
+   AND p.message_id = m.message_id
+   AND p.prefilter_version = ?
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+  AND (p.chat_id IS NULL OR p.matched = 1)
 """
 
 _SELECT_UNCLASSIFIED = """
@@ -346,6 +393,8 @@ class MessageStore:
         self._conn.execute(_AI_SCHEMA)
         self._conn.execute(_AI_INDEX)
         self._migrate_ai_analysis()
+        self._conn.execute(_PREFILTER_SCHEMA)
+        self._conn.execute(_PREFILTER_INDEX)
         self._conn.commit()
 
     def _migrate_messages(self) -> None:
@@ -636,19 +685,65 @@ class MessageStore:
             "attempts": int(row[8]),
         }
 
+    def save_prefilter_results(self, rows) -> int:
+        """Persist prefilter decisions (idempotent per prefilter version).
+
+        Each row is ``(chat_id, message_id, prefilter_version, matched,
+        matched_rules_json, checked_at_utc)``. Returns the number of new rows.
+        An existing ``(chat_id, message_id, prefilter_version)`` row is kept, so
+        a decision is stable for a version; bumping the version re-checks.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        before = self._conn.total_changes
+        self._conn.executemany(_INSERT_PREFILTER, rows)
+        self._conn.commit()
+        return int(self._conn.total_changes - before)
+
+    def get_prefilter_result(
+        self, chat_id, message_id, prefilter_version
+    ) -> Optional[dict]:
+        """Return a stored prefilter decision, or ``None``."""
+        row = self._conn.execute(
+            _SELECT_PREFILTER,
+            (int(chat_id), int(message_id), str(prefilter_version)),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "prefilter_version": row[0],
+            "matched": bool(row[1]),
+            "matched_rules": row[2],
+            "checked_at_utc": int(row[3]),
+        }
+
     def count_ai_unprocessed(
-        self, provider, model, prompt_version, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+        self,
+        provider,
+        model,
+        prompt_version,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        prefilter_version: str = "",
     ) -> int:
         """Number of messages still needing AI analysis for this version.
 
-        A message counts when it has no row yet, or a failed row whose
+        A message counts when it has no AI row yet, or a failed row whose
         ``attempts`` is still below ``max_attempts`` (temporary errors stay
-        retryable; successful rows never count).
+        retryable; successful rows never count). Messages recorded as rejected
+        by the given ``prefilter_version`` never count. When
+        ``prefilter_version`` is empty no prefilter filtering is applied.
         """
         return int(
             self._conn.execute(
                 _COUNT_AI_UNPROCESSED,
-                (str(provider), str(model), str(prompt_version), int(max_attempts)),
+                (
+                    str(provider),
+                    str(model),
+                    str(prompt_version),
+                    str(prefilter_version),
+                    int(max_attempts),
+                ),
             ).fetchone()[0]
         )
 
@@ -659,12 +754,14 @@ class MessageStore:
         prompt_version,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         batch_size: int = 500,
+        prefilter_version: str = "",
     ):
         """Yield batches of ``(chat_id, message_id, text)`` needing AI analysis.
 
         Successful rows are skipped; failed rows are retried until their
-        ``attempts`` reach ``max_attempts``. Keyset-paginated by
-        ``(chat_id, message_id)``.
+        ``attempts`` reach ``max_attempts``. Messages recorded as rejected by the
+        given ``prefilter_version`` are skipped so they cannot repeatedly occupy
+        a batch. Keyset-paginated by ``(chat_id, message_id)``.
         """
         last_chat = _INT64_MIN
         last_message = _INT64_MIN
@@ -675,6 +772,7 @@ class MessageStore:
                     str(provider),
                     str(model),
                     str(prompt_version),
+                    str(prefilter_version),
                     int(max_attempts),
                     last_chat,
                     last_message,

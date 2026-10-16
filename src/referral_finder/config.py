@@ -37,6 +37,14 @@ DEFAULT_LLM_MAX_RETRIES = 2
 DEFAULT_LLM_MAX_INPUT_CHARS = 4000
 DEFAULT_LLM_MAX_OUTPUT_TOKENS = 400
 
+# Background AI worker settings (see llm/worker.py). Conservative defaults:
+# poll every 5s, analyse at most 25 messages per cycle, retry a failure up to 3
+# times. Criteria default to empty (the user must opt in explicitly).
+DEFAULT_LLM_CRITERIA = ""
+DEFAULT_LLM_POLL_INTERVAL = 5.0
+DEFAULT_LLM_BATCH_SIZE = 25
+DEFAULT_LLM_MAX_ATTEMPTS = 3
+
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
 TITLE_PREFIX = "title:"
@@ -144,6 +152,10 @@ class Config:
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_max_input_chars: int = DEFAULT_LLM_MAX_INPUT_CHARS
     llm_max_output_tokens: int = DEFAULT_LLM_MAX_OUTPUT_TOKENS
+    llm_criteria: str = DEFAULT_LLM_CRITERIA
+    llm_poll_interval: float = DEFAULT_LLM_POLL_INTERVAL
+    llm_batch_size: int = DEFAULT_LLM_BATCH_SIZE
+    llm_max_attempts: int = DEFAULT_LLM_MAX_ATTEMPTS
 
     def safe_repr(self) -> str:
         """Representation that never exposes the API hash or the LLM key."""
@@ -249,6 +261,20 @@ def load_config(
     if llm_max_output_tokens <= 0:
         raise ConfigError("LLM_MAX_OUTPUT_TOKENS must be positive")
 
+    llm_poll_interval = _as_float(
+        _get(env, "LLM_POLL_INTERVAL"), DEFAULT_LLM_POLL_INTERVAL
+    )
+    if llm_poll_interval <= 0:
+        raise ConfigError("LLM_POLL_INTERVAL must be positive")
+    llm_batch_size = _as_int(_get(env, "LLM_BATCH_SIZE"), DEFAULT_LLM_BATCH_SIZE)
+    if llm_batch_size < 1:
+        raise ConfigError("LLM_BATCH_SIZE must be at least 1")
+    llm_max_attempts = _as_int(
+        _get(env, "LLM_MAX_ATTEMPTS"), DEFAULT_LLM_MAX_ATTEMPTS
+    )
+    if llm_max_attempts < 1:
+        raise ConfigError("LLM_MAX_ATTEMPTS must be at least 1")
+
     if chats_file is not None:
         chats_path = Path(chats_file).expanduser()
     else:
@@ -274,4 +300,8 @@ def load_config(
         llm_max_retries=llm_max_retries,
         llm_max_input_chars=llm_max_input_chars,
         llm_max_output_tokens=llm_max_output_tokens,
+        llm_criteria=(_get(env, "LLM_CRITERIA") or DEFAULT_LLM_CRITERIA),
+        llm_poll_interval=llm_poll_interval,
+        llm_batch_size=llm_batch_size,
+        llm_max_attempts=llm_max_attempts,
     )
