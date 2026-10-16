@@ -11,6 +11,7 @@ from referral_finder.llm.factory import DEEPSEEK_API_KEY_ENV
 from referral_finder.llm.smoke import SMOKE_MESSAGE, run
 from referral_finder.logging_setup import setup_logging
 from referral_finder.scrubbing import scrub
+from referral_finder.storage import MessageStore
 
 
 def test_without_live_flag_sends_nothing(tmp_path):
@@ -118,7 +119,7 @@ def _chat_response(content, usage=None):
     return HttpResponse(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
-def test_live_path_uses_real_provider_and_sends_no_metadata():
+def test_live_path_uses_real_provider_and_sends_no_metadata(tmp_path):
     content = json.dumps(
         {
             "category": "job_interest",
@@ -128,6 +129,9 @@ def test_live_path_uses_real_provider_and_sends_no_metadata():
         },
         ensure_ascii=False,
     )
+    db = tmp_path / "budget.db"
+    with MessageStore(db):
+        pass  # create the persistent budget database
     transport = FakeTransport(_chat_response(content, {"total_tokens": 42}))
     env = {"LLM_ENABLED": "true", DEEPSEEK_API_KEY_ENV: "SMOKEKEY123"}
 
@@ -135,7 +139,7 @@ def test_live_path_uses_real_provider_and_sends_no_metadata():
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             setup_logging(level="INFO", secrets=[])
-            rc = run(["--live"], env=env, transport=transport)
+            rc = run(["--live", "--db", str(db)], env=env, transport=transport)
             logging.getLogger("unit.smoke").info("using key SMOKEKEY123 now")
     finally:
         root = logging.getLogger()
@@ -169,3 +173,50 @@ def test_live_path_uses_real_provider_and_sends_no_metadata():
     # The API key is masked before any use.
     assert "SMOKEKEY123" not in err.getvalue()
     assert "***" in err.getvalue()
+
+
+def test_live_without_db_sends_nothing():
+    transport = FakeTransport(_chat_response("{}"))
+    env = {"LLM_ENABLED": "true", DEEPSEEK_API_KEY_ENV: "SMOKEKEY123"}
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = run(["--live"], env=env, transport=transport)
+    assert rc == 2
+    assert transport.requests == []
+    assert "--db" in err.getvalue()
+
+
+def test_live_with_missing_db_file_sends_nothing(tmp_path):
+    missing = tmp_path / "nope" / "budget.db"
+    transport = FakeTransport(_chat_response("{}"))
+    env = {"LLM_ENABLED": "true", DEEPSEEK_API_KEY_ENV: "SMOKEKEY123"}
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = run(["--live", "--db", str(missing)], env=env, transport=transport)
+    assert rc == 2
+    assert transport.requests == []
+    assert not missing.exists()  # never silently creates a fresh budget DB
+
+
+def test_live_respects_daily_budget(tmp_path, capsys):
+    db = tmp_path / "budget.db"
+    with MessageStore(db):
+        pass
+    content = json.dumps(
+        {"category": "job_interest", "relevant": True, "confidence": 0.8, "explanation": "ok"},
+        ensure_ascii=False,
+    )
+    transport = FakeTransport(_chat_response(content))
+    env = {
+        "LLM_ENABLED": "true",
+        DEEPSEEK_API_KEY_ENV: "SMOKEKEY123",
+        "LLM_MAX_API_REQUESTS_PER_DAY": "1",
+    }
+    assert run(["--live", "--db", str(db)], env=env, transport=transport) == 0
+    capsys.readouterr()
+
+    # The second live run cannot reserve the daily budget: no HTTP request.
+    assert run(["--live", "--db", str(db)], env=env, transport=transport) == 1
+    out = capsys.readouterr().out
+    assert "error=LLMBudgetExceededError" in out
+    assert len(transport.requests) == 1

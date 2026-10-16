@@ -1,0 +1,175 @@
+# Company reference catalog for prefilter and reporting.
+#
+# Only a small, strictly validated YAML subset is supported: full-line comments
+# (#), blank lines, the top-level "version: N" and "companies:" keys, and per
+# company "id:", "canonical:" and "aliases:". Values may be single- or
+# double-quoted. Keep aliases distinctive: avoid bare generic words that would
+# cause mass false positives.
+version: 1
+
+companies:
+  - id: yandex_eda
+    canonical: Яндекс Еда
+    aliases:
+      - Яндекс Еда
+      - Яндекс.Еда
+      - Yandex Eda
+      - Yandex Eats
+
+  - id: yandex_lavka
+    canonical: Яндекс Лавка
+    aliases:
+      - Яндекс Лавка
+      - Яндекс.Лавка
+      - Yandex Lavka
+
+  - id: yandex_delivery
+    canonical: Яндекс Доставка
+    aliases:
+      - Яндекс Доставка
+      - Яндекс.Доставка
+      - Yandex Delivery
+
+  - id: vkusvill
+    canonical: ВкусВилл
+    aliases:
+      - ВкусВилл
+      - Вкусвилл
+      - Вкус Вилл
+      - VkusVill
+
+  - id: kuper
+    canonical: Купер
+    aliases:
+      - Купер
+      - Kuper
+      - СберМаркет
+      - Сбермаркет
+      - SberMarket
+      - Sbermarket
+
+  - id: samokat
+    canonical: Самокат
+    aliases:
+      - Самокат
+      - Samokat
+
+  - id: x5
+    canonical: X5 Group
+    aliases:
+      - X5 Group
+      - X5 Retail Group
+      - X5
+      - ИКС 5
+      - Икс 5
+
+  - id: pyaterochka
+    canonical: Пятёрочка
+    aliases:
+      - Пятёрочка
+      - Пятерочка
+      - Pyaterochka
+
+  - id: perekrestok
+    canonical: Перекрёсток
+    aliases:
+      - Перекрёсток
+      - Перекресток
+      - Perekrestok
+
+  - id: chizhik
+    canonical: Чижик
+    aliases:
+      - Чижик
+      - Chizhik
+
+  - id: ozon
+    canonical: Ozon
+    aliases:
+      - Ozon
+      - Озон
+      - OZON
+
+  - id: ozon_fresh
+    canonical: Ozon Fresh
+    aliases:
+      - Ozon Fresh
+      - Озон Фреш
+
+  - id: wildberries
+    canonical: Wildberries
+    aliases:
+      - Wildberries
+      - Вайлдберриз
+      - Вайлдберрис
+
+  - id: magnit
+    canonical: Магнит
+    aliases:
+      - Магнит
+      - Magnit
+
+  - id: lenta
+    canonical: Лента
+    aliases:
+      - Лента
+      - Lenta
+
+  - id: metro
+    canonical: METRO
+    aliases:
+      - METRO
+      - Metro
+      - Метро
+      - METRO Cash and Carry
+
+  - id: auchan
+    canonical: Ашан
+    aliases:
+      - Ашан
+      - Auchan
+
+  - id: dixy
+    canonical: Дикси
+    aliases:
+      - Дикси
+      - Dixy
+
+  - id: globus
+    canonical: Глобус
+    aliases:
+      - Глобус
+      - Globus
+
+  - id: okey
+    canonical: О'КЕЙ
+    aliases:
+      - О'КЕЙ
+      - ОКЕЙ
+      - O'KEY
+      - Okey
+
+  - id: azbuka_vkusa
+    canonical: Азбука Вкуса
+    aliases:
+      - Азбука Вкуса
+      - Азбука вкуса
+      - Azbuka Vkusa
+
+  - id: cdek
+    canonical: СДЭК
+    aliases:
+      - СДЭК
+      - CDEK
+
+  - id: dostavista
+    canonical: Достависта
+    aliases:
+      - Достависта
+      - Dostavista
+
+  - id: peshkariki
+    canonical: Пешкарики
+    aliases:
+      - Пешкарики
+      - Peshkariki

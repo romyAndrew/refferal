@@ -19,10 +19,11 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-from ..prefilter import PREFILTER_VERSION, prefilter
+from ..prefilter import effective_prefilter_version, prefilter
 from ..scrubbing import scrub
 from ..storage import MessageStore
 from .base import (
+    LLMBudgetExceededError,
     LLMConfigError,
     LLMError,
     LLMProvider,
@@ -52,6 +53,7 @@ STATUS_SAVED = "saved"
 STATUS_DUPLICATE = "duplicate"
 STATUS_INVALID = "invalid"
 STATUS_STORAGE_ERROR = "storage_error"
+STATUS_BUDGET_EXHAUSTED = "budget_exhausted"
 
 # Short, non-sensitive error codes (no text, no identifiers).
 _ERROR_TIMEOUT = "timeout"
@@ -62,6 +64,7 @@ _ERROR_PROVIDER = "provider_error"
 _ERROR_INVALID_RESPONSE = "invalid_response"
 _ERROR_INVALID_RESULT = "invalid_result"
 _ERROR_STORAGE = "storage_error"
+_ERROR_BUDGET = "budget_exhausted"
 
 
 @dataclass(frozen=True)
@@ -88,12 +91,14 @@ class MessageAnalysisService:
         enabled: bool = False,
         criteria: str = "",
         clock: Optional[Callable[[], int]] = None,
+        catalog=None,
     ):
         self._store = store
         self._provider = provider
         self._enabled = enabled
         self._criteria = criteria
         self._clock = clock or (lambda: int(time.time()))
+        self._catalog = catalog
 
     async def analyze(self, chat_id: int, message_id: int, text: str) -> AnalysisOutcome:
         """Analyse one message and persist the outcome.
@@ -107,7 +112,7 @@ class MessageAnalysisService:
         if self._existing_success(chat_id, message_id):
             return AnalysisOutcome(STATUS_DUPLICATE, matched=True)
 
-        gate = prefilter(text)
+        gate = prefilter(text, self._catalog)
         self._record_prefilter(chat_id, message_id, gate)
         if not gate.matched:
             return AnalysisOutcome(
@@ -141,6 +146,17 @@ class MessageAnalysisService:
             return self._store_failure(
                 chat_id, message_id, STATUS_INVALID, _ERROR_INVALID_RESPONSE,
                 gate.rule_ids, scrubbed.rule_ids,
+            )
+        except LLMBudgetExceededError:
+            # Not a provider failure: no AI row is written and the attempts
+            # counter is not incremented, so the message stays eligible once the
+            # daily budget becomes available again.
+            return AnalysisOutcome(
+                STATUS_BUDGET_EXHAUSTED,
+                matched=True,
+                prefilter_rules=gate.rule_ids,
+                scrub_rules=scrubbed.rule_ids,
+                error=_ERROR_BUDGET,
             )
         except LLMError:
             return self._store_failure(
@@ -219,7 +235,7 @@ class MessageAnalysisService:
         row = (
             int(chat_id),
             int(message_id),
-            PREFILTER_VERSION,
+            effective_prefilter_version(self._catalog),
             int(gate.matched),
             json.dumps(list(gate.rule_ids)),
             int(self._clock()),

@@ -194,3 +194,17 @@ def test_missing_worker_vars_keep_old_config(tmp_path):
     assert config.llm_poll_interval == 5.0
     assert config.llm_batch_size == 25
     assert config.llm_max_attempts == 3
+
+
+def test_llm_api_request_budget_default_and_override(tmp_path):
+    chats = tmp_path / "chats.txt"
+    assert load_config(make_env(), chats_file=chats).llm_max_api_requests_per_day == 10000
+    config = load_config(make_env(LLM_MAX_API_REQUESTS_PER_DAY="250"), chats_file=chats)
+    assert config.llm_max_api_requests_per_day == 250
+
+
+def test_llm_api_request_budget_invalid_raises(tmp_path):
+    chats = tmp_path / "chats.txt"
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(ConfigError):
+            load_config(make_env(LLM_MAX_API_REQUESTS_PER_DAY=bad), chats_file=chats)

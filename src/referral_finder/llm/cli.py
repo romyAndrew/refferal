@@ -19,7 +19,8 @@ import os
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from ..prefilter import PREFILTER_VERSION
+from ..companies import load_default_catalog
+from ..prefilter import effective_prefilter_version
 from ..storage import DEFAULT_MAX_ATTEMPTS, MessageStore
 from .fake import FakeProvider
 from .service import (
@@ -69,6 +70,14 @@ def _build_parser() -> argparse.ArgumentParser:
             f"alone (default {DEFAULT_MAX_ATTEMPTS})"
         ),
     )
+    parser.add_argument(
+        "--companies",
+        default=None,
+        help=(
+            "company reference catalog (default: the repository "
+            "config/companies.yaml, or TG_COMPANIES_FILE if set)"
+        ),
+    )
     return parser
 
 
@@ -83,9 +92,11 @@ def _empty_counts() -> dict:
     }
 
 
-async def _run_pipeline(store, provider, enabled, criteria, limit, max_attempts) -> dict:
+async def _run_pipeline(
+    store, provider, enabled, criteria, limit, max_attempts, catalog
+) -> dict:
     service = MessageAnalysisService(
-        store, provider, enabled=enabled, criteria=criteria
+        store, provider, enabled=enabled, criteria=criteria, catalog=catalog
     )
     version = effective_analysis_version(provider.prompt_version, criteria)
     counts = _empty_counts()
@@ -94,7 +105,7 @@ async def _run_pipeline(store, provider, enabled, criteria, limit, max_attempts)
         provider.model,
         version,
         max_attempts=max_attempts,
-        prefilter_version=PREFILTER_VERSION,
+        prefilter_version=effective_prefilter_version(catalog),
     ):
         for chat_id, message_id, text in batch:
             if limit is not None and counts["checked"] >= limit:
@@ -135,11 +146,16 @@ def run(
     enabled: Optional[bool] = None,
     provider=None,
     env: Optional[Mapping[str, str]] = None,
+    catalog=None,
 ) -> int:
     args = _build_parser().parse_args(argv)
     provider = provider or FakeProvider()
     if enabled is None:
         enabled = _env_enabled(env if env is not None else os.environ)
+    if catalog is None:
+        catalog = load_default_catalog(
+            Path(args.companies).expanduser() if args.companies else None
+        )
 
     store = MessageStore(Path(args.db).expanduser())
     try:
@@ -150,7 +166,7 @@ def run(
                 provider.model,
                 version,
                 max_attempts=args.max_attempts,
-                prefilter_version=PREFILTER_VERSION,
+                prefilter_version=effective_prefilter_version(catalog),
             )
             print(
                 f"dry_run=1 pending={pending} version={version}"
@@ -163,7 +179,13 @@ def run(
 
         counts = asyncio.run(
             _run_pipeline(
-                store, provider, enabled, args.criteria, args.limit, args.max_attempts
+                store,
+                provider,
+                enabled,
+                args.criteria,
+                args.limit,
+                args.max_attempts,
+                catalog,
             )
         )
         print(_format(counts, enabled=True))

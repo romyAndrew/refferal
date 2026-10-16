@@ -1,26 +1,32 @@
 """Structured AI-analysis contract shared by every provider.
 
-The six categories are reused from the rule-based classifier
-(:mod:`referral_finder.classifier`) so both systems speak the same vocabulary;
-their meaning is not changed here.
+The categories are reused from the shared taxonomy in
+:mod:`referral_finder.classifier`, so the LLM, the rule baseline and reporting
+speak the same vocabulary; their meaning is not changed here.
 
 Relationship between ``relevant`` and ``category`` (enforced by
 :func:`validate_analysis`):
 
-==================== ===========
-``category``         ``relevant``
-==================== ===========
-referral_request     True
-job_interest         True
-referral_offer       True
-recruitment_offer    True
-irrelevant           False
-uncertain            None (abstain)
-==================== ===========
+========================= ===========
+``category``              ``relevant``
+========================= ===========
+referral_request          True
+job_interest              True
+referral_offer            True
+recruitment_offer         True
+company_contact_search    True
+irrelevant                False
+uncertain                 None (abstain)
+========================= ===========
 
 ``uncertain`` is therefore kept as a distinct result and is never folded into
 ``irrelevant``. ``confidence`` is a heuristic self-assessment in ``[0, 1]``; it
 must not be presented as the (calibrated) probability of a correct answer.
+
+``company_contact_search`` is a **weak** signal: the author looks for a person,
+employee or acquaintance connected to a company/service without asking for a
+job or a referral link. It is stored and reported separately and must not be
+treated as a confirmed lead.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from typing import Optional
 
 from ..classifier import (
     CATEGORIES,
+    COMPANY_CONTACT_SEARCH,
     IRRELEVANT,
     JOB_INTEREST,
     RECRUITMENT_OFFER,
@@ -43,6 +50,7 @@ RELEVANT_CATEGORIES = (
     JOB_INTEREST,
     REFERRAL_OFFER,
     RECRUITMENT_OFFER,
+    COMPANY_CONTACT_SEARCH,
 )
 
 STATUS_OK = "ok"

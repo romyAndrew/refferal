@@ -45,6 +45,10 @@ DEFAULT_LLM_POLL_INTERVAL = 5.0
 DEFAULT_LLM_BATCH_SIZE = 25
 DEFAULT_LLM_MAX_ATTEMPTS = 3
 
+# Hard limit of outgoing HTTP requests per UTC calendar day (shared by
+# bootstrap, the steady worker, manual backfill and the smoke command).
+DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY = 10000
+
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
 TITLE_PREFIX = "title:"
@@ -156,6 +160,7 @@ class Config:
     llm_poll_interval: float = DEFAULT_LLM_POLL_INTERVAL
     llm_batch_size: int = DEFAULT_LLM_BATCH_SIZE
     llm_max_attempts: int = DEFAULT_LLM_MAX_ATTEMPTS
+    llm_max_api_requests_per_day: int = DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY
 
     def safe_repr(self) -> str:
         """Representation that never exposes the API hash or the LLM key."""
@@ -275,6 +280,13 @@ def load_config(
     if llm_max_attempts < 1:
         raise ConfigError("LLM_MAX_ATTEMPTS must be at least 1")
 
+    llm_max_api_requests_per_day = _as_int(
+        _get(env, "LLM_MAX_API_REQUESTS_PER_DAY"),
+        DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY,
+    )
+    if llm_max_api_requests_per_day < 1:
+        raise ConfigError("LLM_MAX_API_REQUESTS_PER_DAY must be at least 1")
+
     if chats_file is not None:
         chats_path = Path(chats_file).expanduser()
     else:
@@ -304,4 +316,5 @@ def load_config(
         llm_poll_interval=llm_poll_interval,
         llm_batch_size=llm_batch_size,
         llm_max_attempts=llm_max_attempts,
+        llm_max_api_requests_per_day=llm_max_api_requests_per_day,
     )

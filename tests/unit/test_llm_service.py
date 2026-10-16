@@ -45,6 +45,18 @@ class FakeTransport:
         return HttpResponse(200, b"{}")
 
 
+class AllowAllBudget:
+    """Permissive test budget for a real provider used with a fake transport."""
+
+    limit = 1_000_000
+
+    def reserve(self) -> bool:
+        return True
+
+    def used(self) -> int:
+        return 0
+
+
 def seed(store, message_id, text):
     store.save(
         IncomingMessage(
@@ -205,7 +217,9 @@ async def test_disabled_service_never_calls_network_provider(tmp_path):
     with MessageStore(tmp_path / "m.db") as store:
         seed(store, 1, MATCHING)
         transport = FakeTransport()
-        provider = DeepSeekProvider(api_key="placeholder", transport=transport)
+        provider = DeepSeekProvider(
+            api_key="placeholder", transport=transport, budget=AllowAllBudget()
+        )
         service = MessageAnalysisService(store, provider, enabled=False)
 
         outcome = await service.analyze(CHAT, 1, MATCHING)

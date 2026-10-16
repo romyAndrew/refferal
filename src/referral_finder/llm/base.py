@@ -51,6 +51,14 @@ class LLMResponseError(LLMError):
     """The provider answered, but the body/JSON/schema was unusable."""
 
 
+class LLMBudgetExceededError(LLMError):
+    """The daily UTC HTTP-request budget is exhausted; no request was sent.
+
+    This is not a provider failure: the message stays queued and becomes
+    eligible again once the UTC day changes.
+    """
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Common surface of any analysis provider."""

@@ -1,9 +1,20 @@
 """Rule-based message classifier.
 
 A pure, deterministic function: no network, no external LLM/API, no randomness.
-It classifies the stored message text (or media caption) into one of six
+It classifies the stored message text (or media caption) into one of the shared
 categories. The result carries the matched rule ids so a decision can be
 explained without copying the message text.
+
+``CATEGORIES`` is the shared taxonomy. The rule engine below emits its original
+six categories; ``COMPANY_CONTACT_SEARCH`` is part of the taxonomy (used by the
+LLM pipeline and reporting) but has no rule yet, so the offline baseline never
+predicts it. This keeps the rule baseline unchanged while the taxonomy and the
+LLM prompt can grow without mixing old results with new analysis versions.
+
+``COMPANY_CONTACT_SEARCH`` is a **weak** signal: the author is looking for a
+person, employee, colleague or acquaintance connected to a company or service,
+without asking for a job or a referral link; the author's intent may be unknown
+and must not be treated as a confirmed lead.
 
 Language coverage: Russian, common English delivery/job/referral terms, and
 common transliteration. ``score`` is a heuristic weight sum, **not** a
@@ -19,12 +30,15 @@ from typing import Tuple
 
 # Active classifier version. Bump this whenever rules change; the store keeps
 # one result per (chat_id, message_id, classifier_version).
-CLASSIFIER_VERSION = "rules-2026.06"
+CLASSIFIER_VERSION = "rules-2026.11"
 
 REFERRAL_REQUEST = "referral_request"
 JOB_INTEREST = "job_interest"
 REFERRAL_OFFER = "referral_offer"
 RECRUITMENT_OFFER = "recruitment_offer"
+# Weak signal: a search for a person/employee/acquaintance tied to a company,
+# without a job or referral request. LLM-only for now (no rule below).
+COMPANY_CONTACT_SEARCH = "company_contact_search"
 IRRELEVANT = "irrelevant"
 UNCERTAIN = "uncertain"
 
@@ -33,6 +47,7 @@ CATEGORIES: Tuple[str, ...] = (
     JOB_INTEREST,
     REFERRAL_OFFER,
     RECRUITMENT_OFFER,
+    COMPANY_CONTACT_SEARCH,
     IRRELEVANT,
     UNCERTAIN,
 )

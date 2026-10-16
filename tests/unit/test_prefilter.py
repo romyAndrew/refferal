@@ -105,6 +105,34 @@ def test_mixed_script_referral_matches():
     assert "prefilter.referral" in result.rule_ids
 
 
+def test_company_person_search_matches():
+    for text in (
+        "Кто работает в Яндексе?",
+        "Есть знакомые в Яндекс Еде?",
+        "Кто-нибудь работает курьером в Самокате?",
+        "Есть тут сотрудники Озона?",
+        "Кто может подсказать, как связаться с человеком из этой компании?",
+        "Who works at Yandex?",
+        "Do you know anyone at Ozon?",
+        "kto rabotaet v yandeks",
+        "est znakomye v ozon",
+    ):
+        result = prefilter(text)
+        assert result.matched is True, text
+        assert "prefilter.company_person" in result.rule_ids, text
+
+
+def test_company_mention_or_support_contact_is_not_person_search():
+    for text in (
+        "Яндекс доставил заказ",
+        "Какой телефон службы поддержки Яндекса?",
+        "Оставьте свои контакты",
+    ):
+        result = prefilter(text)
+        assert "prefilter.company_person" not in result.rule_ids, text
+        assert result.matched is False, text
+
+
 # --- negative / precision guardrails --------------------------------------
 
 

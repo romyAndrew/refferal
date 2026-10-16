@@ -16,8 +16,9 @@ happens elsewhere (see :mod:`referral_finder.telegram_client`).
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 from .classifier import CANDIDATE_CATEGORIES as _CANDIDATE_CATEGORIES
 from .models import IncomingMessage
@@ -367,6 +368,194 @@ ON CONFLICT(chat_id) DO UPDATE SET
     updated_at_utc = excluded.updated_at_utc
 """
 
+# --- bootstrap state (first-seen chats) ----------------------------------
+# One row per configured chat: the fixed initial snapshot (up to the bootstrap
+# limit) and the per-chat steady high-water mark. Messages with
+# ``message_id > steady_after_message_id`` are the steady stream; older messages
+# (including history beyond the snapshot window) are never auto-analysed.
+# ``steady_after_message_id`` is NOT NULL and is 0 for a chat that has no
+# messages yet, so any future message (id >= 1) is correctly treated as steady
+# instead of being excluded by a NULL comparison.
+_BOOTSTRAP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ai_bootstrap_state (
+    chat_id                 INTEGER PRIMARY KEY,
+    status                  TEXT    NOT NULL,
+    available_count         INTEGER NOT NULL,
+    selected_count          INTEGER NOT NULL,
+    steady_after_message_id INTEGER NOT NULL,
+    created_at_utc          INTEGER NOT NULL,
+    updated_at_utc          INTEGER NOT NULL
+)
+"""
+
+# The fixed snapshot membership: exactly the messages chosen at snapshot time,
+# so a restart reuses the same selection instead of re-picking a different one.
+_BOOTSTRAP_ITEM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ai_bootstrap_item (
+    chat_id      INTEGER NOT NULL,
+    message_id   INTEGER NOT NULL,
+    added_at_utc INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id),
+    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+)
+"""
+
+_BOOTSTRAP_ITEM_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_bootstrap_item_chat "
+    "ON ai_bootstrap_item(chat_id, message_id)"
+)
+
+# --- daily API request budget --------------------------------------------
+# One row per UTC day; ``used`` counts every outgoing HTTP attempt (including
+# retries). Reserved atomically with a single upsert so concurrent callers can
+# never exceed ``limit``.
+_API_BUDGET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS api_request_budget (
+    day_utc        TEXT    PRIMARY KEY,
+    used           INTEGER NOT NULL,
+    updated_at_utc INTEGER NOT NULL
+)
+"""
+
+# Atomic reserve: the INSERT seeds a new day at 1; the DO UPDATE only fires while
+# used < limit. ``rowcount`` is 0 when the limit is exhausted (no row changed),
+# which the caller interprets as "denied".
+_RESERVE_API_REQUEST = """
+INSERT INTO api_request_budget (day_utc, used, updated_at_utc)
+VALUES (?, 1, ?)
+ON CONFLICT(day_utc) DO UPDATE SET
+    used = used + 1,
+    updated_at_utc = excluded.updated_at_utc
+WHERE used < ?
+"""
+
+_SELECT_API_USED = "SELECT used FROM api_request_budget WHERE day_utc = ?"
+
+_INSERT_BOOTSTRAP_STATE = """
+INSERT INTO ai_bootstrap_state (
+    chat_id, status, available_count, selected_count, steady_after_message_id,
+    created_at_utc, updated_at_utc
+)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id) DO NOTHING
+"""
+
+_SELECT_BOOTSTRAP_STATE = """
+SELECT chat_id, status, available_count, selected_count,
+       steady_after_message_id, created_at_utc, updated_at_utc
+FROM ai_bootstrap_state
+WHERE chat_id = ?
+"""
+
+_SELECT_BOOTSTRAP_CHAT_IDS = "SELECT chat_id FROM ai_bootstrap_state ORDER BY chat_id"
+
+_UPDATE_BOOTSTRAP_STATUS = (
+    "UPDATE ai_bootstrap_state SET status = ?, updated_at_utc = ? WHERE chat_id = ?"
+)
+
+# COALESCE keeps the watermark a number (0) for an empty chat; a NULL would make
+# ``message_id > NULL`` false and silently drop every future message.
+_SELECT_MAX_MESSAGE_ID = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE chat_id = ?"
+
+_COUNT_TEXT_MESSAGES = (
+    "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND text IS NOT NULL"
+)
+
+_SELECT_LAST_TEXT_MESSAGES = """
+SELECT message_id FROM messages
+WHERE chat_id = ? AND text IS NOT NULL
+ORDER BY message_id DESC
+LIMIT ?
+"""
+
+_INSERT_BOOTSTRAP_ITEM = """
+INSERT INTO ai_bootstrap_item (chat_id, message_id, added_at_utc)
+VALUES (?, ?, ?)
+ON CONFLICT(chat_id, message_id) DO NOTHING
+"""
+
+# Bootstrap selection: the fixed snapshot items, no prefilter join (bootstrap
+# bypasses prefilter); AI success/attempts still bound repeats.
+_SELECT_AI_BOOTSTRAP = """
+SELECT m.chat_id, m.message_id, m.text
+FROM ai_bootstrap_item b
+JOIN messages m
+    ON m.chat_id = b.chat_id AND m.message_id = b.message_id
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+WHERE m.text IS NOT NULL
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+  AND (m.chat_id, m.message_id) > (?, ?)
+ORDER BY m.chat_id, m.message_id
+LIMIT ?
+"""
+
+_COUNT_AI_BOOTSTRAP = """
+SELECT COUNT(*)
+FROM ai_bootstrap_item b
+JOIN messages m
+    ON m.chat_id = b.chat_id AND m.message_id = b.message_id
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+WHERE m.text IS NOT NULL
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+"""
+
+# Steady selection: only messages strictly newer than the per-chat high-water
+# mark. Old history (including beyond the bootstrap window) is never selected.
+_SELECT_AI_UNPROCESSED_STEADY = """
+SELECT m.chat_id, m.message_id, m.text
+FROM messages m
+JOIN ai_bootstrap_state s
+    ON s.chat_id = m.chat_id
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+LEFT JOIN message_prefilter p
+    ON p.chat_id = m.chat_id
+   AND p.message_id = m.message_id
+   AND p.prefilter_version = ?
+WHERE m.text IS NOT NULL
+  AND m.message_id > s.steady_after_message_id
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+  AND (p.chat_id IS NULL OR p.matched = 1)
+  AND (m.chat_id, m.message_id) > (?, ?)
+ORDER BY m.chat_id, m.message_id
+LIMIT ?
+"""
+
+_COUNT_AI_UNPROCESSED_STEADY = """
+SELECT COUNT(*)
+FROM messages m
+JOIN ai_bootstrap_state s
+    ON s.chat_id = m.chat_id
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = m.chat_id
+   AND a.message_id = m.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+LEFT JOIN message_prefilter p
+    ON p.chat_id = m.chat_id
+   AND p.message_id = m.message_id
+   AND p.prefilter_version = ?
+WHERE m.text IS NOT NULL
+  AND m.message_id > s.steady_after_message_id
+  AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+  AND (p.chat_id IS NULL OR p.matched = 1)
+"""
+
 
 class MessageStore:
     """Thin SQLite wrapper around the ``messages`` table.
@@ -395,6 +584,10 @@ class MessageStore:
         self._migrate_ai_analysis()
         self._conn.execute(_PREFILTER_SCHEMA)
         self._conn.execute(_PREFILTER_INDEX)
+        self._conn.execute(_BOOTSTRAP_SCHEMA)
+        self._conn.execute(_BOOTSTRAP_ITEM_SCHEMA)
+        self._conn.execute(_BOOTSTRAP_ITEM_INDEX)
+        self._conn.execute(_API_BUDGET_SCHEMA)
         self._conn.commit()
 
     def _migrate_messages(self) -> None:
@@ -685,6 +878,177 @@ class MessageStore:
             "attempts": int(row[8]),
         }
 
+    # --- bootstrap state (first-seen chats) --------------------------------
+
+    def snapshot_bootstrap(
+        self, chat_ids: Iterable[int], limit: int = 200, clock: Optional[Callable[[], float]] = None
+    ) -> list:
+        """Fix the initial snapshot for chats that have no bootstrap state yet.
+
+        For each chat, records the per-chat ``steady_after_message_id`` (the
+        maximum id of every message already stored) and stores the most recent
+        up-to-``limit`` text messages as fixed bootstrap items. Idempotent: a
+        chat that already has state is left untouched, so a restart never
+        re-picks a different snapshot. Chats without messages still get a state
+        row with zero counts.
+
+        Returns a list of summary dicts (one per chat).
+        """
+        now = int((clock or time.time)())
+        summaries = []
+        for chat_id in chat_ids:
+            chat_id = int(chat_id)
+            existing = self._conn.execute(_SELECT_BOOTSTRAP_STATE, (chat_id,)).fetchone()
+            if existing is not None:
+                summaries.append(self._bootstrap_state_dict(existing, created=False))
+                continue
+
+            available = int(
+                self._conn.execute(_COUNT_TEXT_MESSAGES, (chat_id,)).fetchone()[0]
+            )
+            steady_after = int(
+                self._conn.execute(_SELECT_MAX_MESSAGE_ID, (chat_id,)).fetchone()[0]
+            )
+            message_ids = [
+                int(row[0])
+                for row in self._conn.execute(
+                    _SELECT_LAST_TEXT_MESSAGES, (chat_id, int(limit))
+                ).fetchall()
+            ]
+            self._conn.execute(
+                _INSERT_BOOTSTRAP_STATE,
+                (chat_id, "pending", available, len(message_ids), steady_after, now, now),
+            )
+            self._conn.executemany(
+                _INSERT_BOOTSTRAP_ITEM,
+                [(chat_id, message_id, now) for message_id in message_ids],
+            )
+            self._conn.commit()
+            summaries.append(
+                {
+                    "chat_id": chat_id,
+                    "status": "pending",
+                    "available_count": available,
+                    "selected_count": len(message_ids),
+                    "steady_after_message_id": steady_after,
+                    "created_at_utc": now,
+                    "updated_at_utc": now,
+                    "created": True,
+                }
+            )
+        return summaries
+
+    @staticmethod
+    def _bootstrap_state_dict(row, *, created: bool = False) -> dict:
+        return {
+            "chat_id": int(row[0]),
+            "status": row[1],
+            "available_count": int(row[2]),
+            "selected_count": int(row[3]),
+            "steady_after_message_id": int(row[4]),
+            "created_at_utc": int(row[5]),
+            "updated_at_utc": int(row[6]),
+            "created": created,
+        }
+
+    def get_bootstrap_state(self, chat_id: int) -> Optional[dict]:
+        """Return the bootstrap state for ``chat_id``, or ``None``."""
+        row = self._conn.execute(
+            _SELECT_BOOTSTRAP_STATE, (int(chat_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._bootstrap_state_dict(row, created=False)
+
+    def bootstrap_chat_ids(self) -> list:
+        """Return chat ids that already have a bootstrap state."""
+        return [int(row[0]) for row in self._conn.execute(_SELECT_BOOTSTRAP_CHAT_IDS)]
+
+    def set_bootstrap_status(
+        self, chat_id: int, status: str, clock: Optional[Callable[[], float]] = None
+    ) -> None:
+        """Update the bootstrap status for ``chat_id`` (pending/running/done)."""
+        now = int((clock or time.time)())
+        self._conn.execute(_UPDATE_BOOTSTRAP_STATUS, (str(status), now, int(chat_id)))
+        self._conn.commit()
+
+    def iter_ai_bootstrap(
+        self,
+        provider,
+        model,
+        prompt_version,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        batch_size: int = 500,
+    ):
+        """Yield batches of fixed bootstrap ``(chat_id, message_id, text)``.
+
+        No prefilter join: the bootstrap set bypasses prefilter by design. A
+        successful AI result is skipped; failures are retried up to
+        ``max_attempts``. Keyset-paginated by ``(chat_id, message_id)``.
+        """
+        last_chat = _INT64_MIN
+        last_message = _INT64_MIN
+        while True:
+            rows = self._conn.execute(
+                _SELECT_AI_BOOTSTRAP,
+                (
+                    str(provider),
+                    str(model),
+                    str(prompt_version),
+                    int(max_attempts),
+                    last_chat,
+                    last_message,
+                    int(batch_size),
+                ),
+            ).fetchall()
+            if not rows:
+                return
+            yield [(int(r[0]), int(r[1]), r[2]) for r in rows]
+            last_chat = int(rows[-1][0])
+            last_message = int(rows[-1][1])
+            if len(rows) < batch_size:
+                return
+
+    def count_ai_bootstrap(
+        self,
+        provider,
+        model,
+        prompt_version,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    ) -> int:
+        """Number of bootstrap items still needing analysis for this version."""
+        return int(
+            self._conn.execute(
+                _COUNT_AI_BOOTSTRAP,
+                (str(provider), str(model), str(prompt_version), int(max_attempts)),
+            ).fetchone()[0]
+        )
+
+    # --- daily API request budget ------------------------------------------
+
+    def reserve_api_request(
+        self, day_utc: str, limit: int, updated_at_utc: int
+    ) -> bool:
+        """Atomically reserve one outgoing HTTP request for ``day_utc``.
+
+        Returns ``True`` when the request is allowed (and ``used`` was
+        incremented), ``False`` when the daily limit is already reached. The
+        single upsert is atomic, so concurrent callers/connections cannot jointly
+        exceed ``limit``.
+        """
+        if int(limit) < 1:
+            raise ValueError("limit must be at least 1")
+        cursor = self._conn.execute(
+            _RESERVE_API_REQUEST, (str(day_utc), int(updated_at_utc), int(limit))
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def api_requests_used(self, day_utc: str) -> int:
+        """Number of requests already consumed for ``day_utc`` (0 if unseen)."""
+        row = self._conn.execute(_SELECT_API_USED, (str(day_utc),)).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def save_prefilter_results(self, rows) -> int:
         """Persist prefilter decisions (idempotent per prefilter version).
 
@@ -725,6 +1089,7 @@ class MessageStore:
         prompt_version,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         prefilter_version: str = "",
+        steady_only: bool = False,
     ) -> int:
         """Number of messages still needing AI analysis for this version.
 
@@ -733,7 +1098,24 @@ class MessageStore:
         retryable; successful rows never count). Messages recorded as rejected
         by the given ``prefilter_version`` never count. When
         ``prefilter_version`` is empty no prefilter filtering is applied.
+
+        With ``steady_only=True`` only messages strictly newer than each chat's
+        bootstrap high-water mark are counted (no old history, no bootstrap
+        snapshot); chats without a bootstrap state are excluded entirely.
         """
+        if steady_only:
+            return int(
+                self._conn.execute(
+                    _COUNT_AI_UNPROCESSED_STEADY,
+                    (
+                        str(provider),
+                        str(model),
+                        str(prompt_version),
+                        str(prefilter_version),
+                        int(max_attempts),
+                    ),
+                ).fetchone()[0]
+            )
         return int(
             self._conn.execute(
                 _COUNT_AI_UNPROCESSED,
@@ -755,6 +1137,7 @@ class MessageStore:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         batch_size: int = 500,
         prefilter_version: str = "",
+        steady_only: bool = False,
     ):
         """Yield batches of ``(chat_id, message_id, text)`` needing AI analysis.
 
@@ -762,12 +1145,17 @@ class MessageStore:
         ``attempts`` reach ``max_attempts``. Messages recorded as rejected by the
         given ``prefilter_version`` are skipped so they cannot repeatedly occupy
         a batch. Keyset-paginated by ``(chat_id, message_id)``.
+
+        With ``steady_only=True`` only messages strictly newer than each chat's
+        bootstrap high-water mark are yielded, so historical messages (including
+        those beyond the bootstrap snapshot) can never enter the steady stream.
         """
+        select = _SELECT_AI_UNPROCESSED_STEADY if steady_only else _SELECT_AI_UNPROCESSED
         last_chat = _INT64_MIN
         last_message = _INT64_MIN
         while True:
             rows = self._conn.execute(
-                _SELECT_AI_UNPROCESSED,
+                select,
                 (
                     str(provider),
                     str(model),

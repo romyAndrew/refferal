@@ -22,6 +22,18 @@ from referral_finder.scrubbing import scrub
 API_KEY = "test-key-placeholder"
 
 
+class AllowAllBudget:
+    """Permissive test budget: always allows a request, never touches storage."""
+
+    limit = 1_000_000
+
+    def reserve(self) -> bool:
+        return True
+
+    def used(self) -> int:
+        return 0
+
+
 class FakeTransport:
     """Records requests and returns/raises canned responses; never connects."""
 
@@ -59,6 +71,7 @@ def analysis_content(category=JOB_INTEREST, relevant=True, confidence=0.8) -> st
 def provider(transport, **kwargs) -> DeepSeekProvider:
     kwargs.setdefault("api_key", API_KEY)
     kwargs.setdefault("backoff_seconds", 0.0)
+    kwargs.setdefault("budget", AllowAllBudget())
     return DeepSeekProvider(transport=transport, **kwargs)
 
 
@@ -70,14 +83,22 @@ async def test_analyze_parses_valid_response():
     assert result.confidence == 0.8
 
 
+def test_provider_requires_a_budget():
+    # No production path may send an HTTP request without reserving the budget.
+    with pytest.raises(TypeError):
+        DeepSeekProvider(api_key=API_KEY, transport=FakeTransport([]))
+    with pytest.raises(LLMConfigError):
+        DeepSeekProvider(api_key=API_KEY, transport=FakeTransport([]), budget=None)
+
+
 def test_api_key_is_required():
     with pytest.raises(LLMConfigError):
-        DeepSeekProvider(api_key="")
+        DeepSeekProvider(api_key="", budget=AllowAllBudget())
 
 
 def test_default_transport_is_std_lib_and_constructs_offline():
     # Constructing the provider must not open a socket or resolve DNS.
-    p = DeepSeekProvider(api_key=API_KEY)
+    p = DeepSeekProvider(api_key=API_KEY, budget=AllowAllBudget())
     assert isinstance(p._transport, UrllibHttpTransport)
 
 

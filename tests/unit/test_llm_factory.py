@@ -15,6 +15,7 @@ from referral_finder.llm import (
     provider_from_config,
 )
 from referral_finder.logging_setup import setup_logging
+from referral_finder.storage import MessageStore
 
 
 def make_config(tmp_path, **overrides):
@@ -41,12 +42,24 @@ def test_enabled_deepseek_with_key_builds_real_provider(tmp_path):
     config = make_config(
         tmp_path, LLM_ENABLED="true", LLM_PROVIDER="deepseek", LLM_MODEL="deepseek-flash"
     )
-    provider = provider_from_config(
-        config, environ={DEEPSEEK_API_KEY_ENV: "env-key"}, transport=object()
-    )
-    assert isinstance(provider, DeepSeekProvider)
-    assert provider.model == "deepseek-flash"
-    assert provider.prompt_version  # template version present
+    with MessageStore(tmp_path / "m.db") as store:
+        provider = provider_from_config(
+            config,
+            store=store,
+            environ={DEEPSEEK_API_KEY_ENV: "env-key"},
+            transport=object(),
+        )
+        assert isinstance(provider, DeepSeekProvider)
+        assert provider.model == "deepseek-flash"
+        assert provider.prompt_version  # template version present
+        assert provider._budget.limit == config.llm_max_api_requests_per_day
+
+
+def test_enabled_deepseek_without_store_raises(tmp_path):
+    # A live provider must never be built without a persistent budget store.
+    config = make_config(tmp_path, LLM_ENABLED="true", LLM_PROVIDER="deepseek")
+    with pytest.raises(LLMConfigError):
+        provider_from_config(config, environ={DEEPSEEK_API_KEY_ENV: "k"})
 
 
 def test_enabled_without_key_raises(tmp_path):
@@ -75,7 +88,10 @@ def test_factory_registers_key_in_secret_filter(tmp_path):
     try:
         with contextlib.redirect_stderr(buffer):
             setup_logging(level="INFO", secrets=[])
-            provider = provider_from_config(config, environ={DEEPSEEK_API_KEY_ENV: "S3CRETKEY"})
+            with MessageStore(tmp_path / "m.db") as store:
+                provider = provider_from_config(
+                    config, store=store, environ={DEEPSEEK_API_KEY_ENV: "S3CRETKEY"}
+                )
             assert isinstance(provider, DeepSeekProvider)
             logging.getLogger("unit.factory").info("using key S3CRETKEY now")
     finally:

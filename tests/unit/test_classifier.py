@@ -8,6 +8,7 @@ import pytest
 from referral_finder.classifier import (
     CATEGORIES,
     CLASSIFIER_VERSION,
+    COMPANY_CONTACT_SEARCH,
     IRRELEVANT,
     JOB_INTEREST,
     RECRUITMENT_OFFER,
@@ -98,6 +99,11 @@ def test_only_known_categories():
     for item in _synthetic():
         result = classify(item["text"])
         assert result.category in CATEGORIES
+
+
+def test_company_contact_search_is_in_the_shared_taxonomy():
+    assert COMPANY_CONTACT_SEARCH in CATEGORIES
+    assert len(CATEGORIES) == len(set(CATEGORIES))
 
 
 # --- synthetic functional/regression set ---------------------------------

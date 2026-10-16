@@ -55,8 +55,34 @@ def test_confidence_is_normalised_to_float():
 def test_expected_relevant_mapping():
     assert expected_relevant("referral_request") is True
     assert expected_relevant("recruitment_offer") is True
+    assert expected_relevant("company_contact_search") is True
     assert expected_relevant("irrelevant") is False
     assert expected_relevant("uncertain") is None
+
+
+def test_company_contact_search_is_valid_and_relevant():
+    result = validate_analysis(
+        {
+            "category": "company_contact_search",
+            "relevant": True,
+            "confidence": 0.7,
+            "explanation": "ищет знакомого в компании",
+        }
+    )
+    assert result.category == "company_contact_search"
+    assert result.relevant is True
+
+
+def test_prompt_lists_company_contact_search():
+    from referral_finder.llm.prompt import system_instructions
+
+    text = system_instructions()
+    assert "company_contact_search" in text
+    # The prompt must distinguish it from a job/referral and from a request for
+    # the company's own contact details.
+    assert "employee" in text
+    assert "referral" in text
+    assert "weak signal" in text
 
 
 @pytest.mark.parametrize(

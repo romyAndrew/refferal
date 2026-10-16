@@ -34,6 +34,19 @@ def provider_ok():
     return FakeProvider(handler=lambda request: AnalysisResult(JOB_INTEREST, True, 0.9, "ok"))
 
 
+def test_run_is_cwd_independent(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "m.db"
+    seed(db, [(1, MATCHING)])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    # The default companies catalog is resolved from the repository, not CWD.
+    assert cli.run(["--db", str(db)], enabled=True, provider=provider_ok()) == 0
+    out = capsys.readouterr().out
+    assert "saved=1" in out
+
+
 def test_dry_run_counts_and_writes_nothing(tmp_path, capsys):
     db = tmp_path / "m.db"
     seed(db, [(1, MATCHING), (2, MATCHING), (3, UNRELATED)])

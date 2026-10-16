@@ -446,42 +446,45 @@ async def test_restart_does_not_reanalyze_success(tmp_path):
         store.close()
 
 
-async def test_bumping_prefilter_version_rechecks_rejected(tmp_path, monkeypatch):
-    import referral_finder.llm.service as service_module
-    import referral_finder.llm.worker as worker_module
+async def test_bumping_prefilter_version_rechecks_rejected(tmp_path):
+    from referral_finder.companies import parse_companies
+    from referral_finder.prefilter import effective_prefilter_version
+
+    catalog_a = parse_companies(
+        "companies:\n  - id: foo\n    canonical: Foo\n    aliases:\n      - Foo\n"
+    )
+    catalog_b = parse_companies(
+        "companies:\n  - id: foo\n    canonical: Foo\n    aliases:\n"
+        "      - Foo\n      - Foo Bar\n"
+    )
+    version_a = effective_prefilter_version(catalog_a)
+    version_b = effective_prefilter_version(catalog_b)
+    assert version_a != version_b
 
     store = MessageStore(tmp_path / "m.db")
     try:
         seed(store, 1, UNRELATED)
         provider = provider_ok()
-        worker = AiWorker(store, provider, enabled=True, wait=CycleWait())
+        worker = AiWorker(store, provider, enabled=True, wait=CycleWait(), catalog=catalog_a)
         await worker.start()
         try:
-            await wait_until(
-                lambda: store.get_prefilter_result(CHAT, 1, PREFILTER_VERSION) is not None
-            )
+            await wait_until(lambda: store.get_prefilter_result(CHAT, 1, version_a) is not None)
         finally:
             await worker.stop()
+        assert store.get_prefilter_result(CHAT, 1, version_a)["matched"] is False
 
-        # Rejection recorded under the current version.
-        assert store.get_prefilter_result(CHAT, 1, PREFILTER_VERSION)["matched"] is False
-
-        # Bump the prefilter version: the old decision no longer applies, so the
-        # message is checked again and a fresh decision is recorded.
-        bumped = "prefilter-test-bump"
-        monkeypatch.setattr(worker_module, "PREFILTER_VERSION", bumped)
-        monkeypatch.setattr(service_module, "PREFILTER_VERSION", bumped)
-
-        worker2 = AiWorker(store, provider, enabled=True, wait=CycleWait())
+        # Changing the catalog changes the effective version: the old rejection
+        # no longer applies, so the message is checked again under the new
+        # version (and does not block re-checking).
+        worker2 = AiWorker(store, provider, enabled=True, wait=CycleWait(), catalog=catalog_b)
         await worker2.start()
         try:
-            await wait_until(
-                lambda: store.get_prefilter_result(CHAT, 1, bumped) is not None
-            )
+            await wait_until(lambda: store.get_prefilter_result(CHAT, 1, version_b) is not None)
         finally:
             await worker2.stop()
 
-        assert store.get_prefilter_result(CHAT, 1, bumped) is not None
-        assert store.get_prefilter_result(CHAT, 1, PREFILTER_VERSION)["matched"] is False
+        assert store.get_prefilter_result(CHAT, 1, version_b) is not None
+        # The old decision is kept, not deleted or overwritten.
+        assert store.get_prefilter_result(CHAT, 1, version_a)["matched"] is False
     finally:
         store.close()

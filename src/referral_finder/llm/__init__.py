@@ -7,6 +7,7 @@ and are disabled by default; nothing here performs any network access.
 """
 
 from .base import (
+    LLMBudgetExceededError,
     LLMConfigError,
     LLMError,
     LLMProvider,
@@ -16,6 +17,7 @@ from .base import (
     LLMServerError,
     LLMTimeoutError,
 )
+from .budget import ApiRequestBudget, utc_day
 from .factory import DEEPSEEK_API_KEY_ENV, provider_from_config
 from .fake import FakeProvider
 from .deepseek import (
@@ -27,6 +29,7 @@ from .deepseek import (
 )
 from .prompt import PROMPT_HASH, PROMPT_VERSION, build_messages
 from .service import (
+    STATUS_BUDGET_EXHAUSTED,
     STATUS_DISABLED,
     STATUS_DUPLICATE,
     STATUS_PREFILTER_SKIPPED,
@@ -54,12 +57,14 @@ __all__ = [
     "AiWorker",
     "AnalysisOutcome",
     "AnalysisResult",
+    "ApiRequestBudget",
     "DEEPSEEK_API_KEY_ENV",
     "DeepSeekProvider",
     "FakeProvider",
     "HttpRequest",
     "HttpResponse",
     "HttpTransport",
+    "LLMBudgetExceededError",
     "LLMConfigError",
     "LLMError",
     "LLMProvider",
@@ -72,6 +77,7 @@ __all__ = [
     "PROMPT_HASH",
     "PROMPT_VERSION",
     "RELEVANT_CATEGORIES",
+    "STATUS_BUDGET_EXHAUSTED",
     "STATUS_DISABLED",
     "STATUS_DUPLICATE",
     "STATUS_ERROR",
@@ -88,5 +94,6 @@ __all__ = [
     "build_messages",
     "expected_relevant",
     "provider_from_config",
+    "utc_day",
     "validate_analysis",
 ]

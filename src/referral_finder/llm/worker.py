@@ -27,7 +27,7 @@ import logging
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 from ..storage import DEFAULT_MAX_ATTEMPTS, MessageStore
-from ..prefilter import PREFILTER_VERSION
+from ..prefilter import effective_prefilter_version
 from .base import LLMProvider
 from .service import MessageAnalysisService
 from .versioning import effective_analysis_version
@@ -56,6 +56,7 @@ class AiWorker:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         enabled: bool = False,
         wait: Optional[Callable[[], Awaitable[None]]] = None,
+        catalog=None,
     ):
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -71,9 +72,10 @@ class AiWorker:
         self._batch_size = batch_size
         self._max_attempts = max_attempts
         self._enabled = enabled
+        self._catalog = catalog
         self._wait = wait or self._default_wait
         self._service = MessageAnalysisService(
-            store, provider, enabled=enabled, criteria=criteria
+            store, provider, enabled=enabled, criteria=criteria, catalog=catalog
         )
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -173,7 +175,7 @@ class AiWorker:
             self.effective_version,
             max_attempts=self._max_attempts,
             batch_size=self._batch_size,
-            prefilter_version=PREFILTER_VERSION,
+            prefilter_version=effective_prefilter_version(self._catalog),
         ):
             return list(chunk)
         return []

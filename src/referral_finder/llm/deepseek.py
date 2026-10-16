@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple
 
 from .base import (
+    LLMBudgetExceededError,
     LLMConfigError,
     LLMError,
     LLMRateLimitError,
@@ -116,7 +117,12 @@ class DeepSeekProvider:
         thinking_type: str = "disabled",
         backoff_seconds: float = 0.5,
         sleep: Optional[Callable[[float], "asyncio.Future"]] = None,
+        budget,
     ):
+        if budget is None:
+            # A live provider must never be able to send an HTTP request without
+            # reserving the shared daily budget first.
+            raise LLMConfigError("a request budget is required for DeepSeekProvider")
         if not api_key:
             raise LLMConfigError("DeepSeek API key is required")
         if max_retries < 0:
@@ -125,6 +131,7 @@ class DeepSeekProvider:
         self.model = model
         self._base_url = base_url.rstrip("/")
         self._transport: HttpTransport = transport or UrllibHttpTransport(timeout)
+        self._budget = budget
         self._max_retries = max_retries
         self._max_input_chars = max_input_chars
         self._max_output_tokens = max_output_tokens
@@ -149,6 +156,10 @@ class DeepSeekProvider:
         attempts = self._max_retries + 1
         last_error: Optional[LLMError] = None
         for attempt in range(attempts):
+            if not self._budget.reserve():
+                # Reserve before every actual send (each retry counts). No HTTP
+                # request is made when the daily UTC budget is exhausted.
+                raise LLMBudgetExceededError("daily API request budget exhausted")
             try:
                 response = await self._transport.send(http_request)
             except LLMTimeoutError as exc:
