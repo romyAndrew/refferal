@@ -277,29 +277,17 @@ class MessageWriter:
             inserted = self._store.save(message)
         except Exception:
             self.errors += 1
-            # Log the identifiers only; never the message text.
-            logger.exception(
-                "Failed to store message chat_id=%s message_id=%s",
-                message.chat_id,
-                message.message_id,
-            )
+            # Never log the message text or Telegram identifiers.
+            logger.exception("Failed to store message")
             return
 
         self._notify_saved((message,))
         if inserted:
             self.saved += 1
-            logger.info(
-                "Stored message chat_id=%s message_id=%s",
-                message.chat_id,
-                message.message_id,
-            )
+            logger.info("Stored message")
         else:
             self.duplicates += 1
-            logger.debug(
-                "Duplicate message ignored chat_id=%s message_id=%s",
-                message.chat_id,
-                message.message_id,
-            )
+            logger.debug("Duplicate message ignored")
 
     def _on_task_done(self, task: asyncio.Task) -> None:
         self._record_failure(task)

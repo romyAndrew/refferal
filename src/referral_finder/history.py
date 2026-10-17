@@ -165,19 +165,14 @@ async def _sync_one_chat(
             await writer.flush()
             if writer.errors > errors_before:
                 error = "persistence errors during history sync"
-                logger.error(
-                    "History sync aborted before checkpoint advance "
-                    "chat_id=%s page_max=%s",
-                    chat_id,
-                    page_max,
-                )
+                logger.error("History sync aborted before checkpoint advance")
                 break
 
             store.set_checkpoint(chat_id, page_max, int(clock()))
             committed = page_max
     except Exception as exc:  # noqa: BLE001 - record, never crash the app
         error = type(exc).__name__
-        logger.exception("History sync failed chat_id=%s", chat_id)
+        logger.exception("History sync failed")
 
     result = ChatSyncResult(
         chat_id=chat_id,
@@ -191,16 +186,13 @@ async def _sync_one_chat(
         error=error,
     )
     logger.info(
-        "History sync chat_id=%s initial=%s examined=%s submitted=%s stored=%s "
-        "skipped=%s checkpoint=%s->%s result=%s",
-        chat_id,
+        "History sync initial=%s examined=%s submitted=%s stored=%s "
+        "skipped=%s result=%s",
         initial,
         examined,
         submitted,
         result.stored,
         skipped,
-        checkpoint_before,
-        committed,
         error or "ok",
     )
     return result

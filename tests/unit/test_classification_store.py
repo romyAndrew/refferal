@@ -2,7 +2,14 @@
 
 import json
 
-from referral_finder.classifier import CLASSIFIER_VERSION
+import pytest
+
+from referral_finder.classifier import (
+    CLASSIFIER_VERSION,
+    COMPANY_CONTACT_SEARCH,
+    RULE_CATEGORIES,
+    classify,
+)
 from referral_finder.models import IncomingMessage
 from referral_finder.storage import MessageStore
 
@@ -41,6 +48,36 @@ def test_classification_table_exists(tmp_path):
             "AND name='message_classifications'"
         ).fetchone()
         assert found == ("message_classifications",)
+
+
+def test_rule_classifier_never_emits_llm_only_category():
+    assert COMPANY_CONTACT_SEARCH not in RULE_CATEGORIES
+    for text in (
+        "Кто работает в Яндексе?",
+        "Есть знакомые в Самокате?",
+        "Ищу работу курьером, дайте рефку",
+        "Предлагаю вакансию курьера",
+    ):
+        result = classify(text)
+        assert result.category in RULE_CATEGORIES
+        assert result.category != COMPANY_CONTACT_SEARCH
+
+
+def test_save_classifications_rejects_llm_only_category_before_sqlite(tmp_path):
+    with MessageStore(tmp_path / "m.db") as store:
+        store.save(make_message(1))
+        rows = [
+            row(CHAT, 1, "v1", "job_interest"),
+            row(CHAT, 1, "v2", COMPANY_CONTACT_SEARCH),
+        ]
+
+        with pytest.raises(ValueError, match="company_contact_search"):
+            store.save_classifications(rows)
+
+        count = store._conn.execute(
+            "SELECT COUNT(*) FROM message_classifications"
+        ).fetchone()[0]
+        assert count == 0
 
 
 def test_save_is_idempotent_per_version(tmp_path):

@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from referral_finder.config import ConfigError, load_config, parse_chats_file
+from referral_finder.config import (
+    ConfigError,
+    load_config,
+    parse_chats_file,
+    resolve_environment,
+    resolve_llm_max_api_requests_per_day,
+)
 
 
 def make_env(**overrides: str) -> dict:
@@ -208,3 +214,46 @@ def test_llm_api_request_budget_invalid_raises(tmp_path):
     for bad in ("0", "-1", "many"):
         with pytest.raises(ConfigError):
             load_config(make_env(LLM_MAX_API_REQUESTS_PER_DAY=bad), chats_file=chats)
+
+
+def test_llm_bootstrap_limit_default_and_override(tmp_path):
+    chats = tmp_path / "chats.txt"
+    assert load_config(make_env(), chats_file=chats).llm_bootstrap_limit == 200
+    config = load_config(make_env(LLM_BOOTSTRAP_LIMIT="50"), chats_file=chats)
+    assert config.llm_bootstrap_limit == 50
+
+
+def test_llm_bootstrap_limit_invalid_raises(tmp_path):
+    chats = tmp_path / "chats.txt"
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(ConfigError):
+            load_config(make_env(LLM_BOOTSTRAP_LIMIT=bad), chats_file=chats)
+
+
+def test_resolve_llm_max_api_requests_per_day_default_and_override():
+    assert resolve_llm_max_api_requests_per_day({}) == 10000
+    assert (
+        resolve_llm_max_api_requests_per_day(
+            {"LLM_MAX_API_REQUESTS_PER_DAY": "7"}
+        )
+        == 7
+    )
+
+
+def test_resolve_llm_max_api_requests_per_day_invalid_raises():
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(ConfigError):
+            resolve_llm_max_api_requests_per_day(
+                {"LLM_MAX_API_REQUESTS_PER_DAY": bad}
+            )
+
+
+def test_resolve_environment_reads_explicit_temp_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / "synthetic.env"
+    env_file.write_text("LLM_MAX_API_REQUESTS_PER_DAY=3\n", encoding="utf-8")
+    monkeypatch.delenv("LLM_MAX_API_REQUESTS_PER_DAY", raising=False)
+
+    env = resolve_environment(env_file=str(env_file))
+
+    assert env["LLM_MAX_API_REQUESTS_PER_DAY"] == "3"
+    assert resolve_llm_max_api_requests_per_day(env) == 3

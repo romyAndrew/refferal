@@ -16,6 +16,7 @@ import logging
 import sys
 from typing import Optional, Sequence
 
+from .app import run_application
 from .classify import ClassifierService
 from .config import Config, ConfigError, load_config
 from .ingest import MessageWriter
@@ -35,10 +36,9 @@ async def _run(config: Config) -> None:
     # history_sync=True: reconcile missed messages on startup (bounded first
     # scan, then everything after the per-chat checkpoint).
     runner = TelegramRunner(config, writer=writer, store=store, history_sync=True)
-    try:
-        await runner.run_forever()
-    finally:
-        await runner.shutdown()
+    # run_application starts Telegram, then (only after a successful history
+    # sync) the AI worker, and shuts both down in a safe order on exit.
+    await run_application(config, store=store, runner=runner)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

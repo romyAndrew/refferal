@@ -397,6 +397,26 @@ async def test_runner_runs_history_sync_when_enabled(tmp_path):
     reopened.close()
 
 
+async def test_runner_exposes_failed_history_chat_ids(tmp_path):
+    db_path = tmp_path / "messages.db"
+    store = MessageStore(db_path)
+    writer = MessageWriter(store)
+    client = FakeRunnerClient({CHAT: [FakeMessage(message_id=1)]})
+    client._history._error = RuntimeError("fetch failed")
+    runner = TelegramRunner(
+        make_config(tmp_path), client=client, writer=writer, store=store, history_sync=True
+    )
+
+    await runner.start()
+
+    assert runner.history_failed_chat_ids() == frozenset({CHAT})
+    assert runner.history_results[0].ok is False
+    assert store.get_checkpoint(CHAT) is None
+    assert store.count() == 0
+
+    await runner.shutdown()
+
+
 async def test_runner_skips_history_sync_when_disabled(tmp_path):
     db_path = tmp_path / "messages.db"
     store = MessageStore(db_path)

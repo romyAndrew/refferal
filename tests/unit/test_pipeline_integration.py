@@ -302,7 +302,9 @@ async def test_db_write_error_is_logged_and_writer_continues(tmp_path, caplog):
     assert writer.running is False
     assert store.count() == 1
     assert store.fetch(DEFAULT_CHAT, 2) is not None
-    assert "Failed to store message chat_id=-1001234567890 message_id=1" in caplog.text
+    assert "Failed to store message" in caplog.text
+    assert "chat_id=" not in caplog.text
+    assert "message_id=" not in caplog.text
     assert "FIRST TEXT" not in caplog.text
     assert "SECOND TEXT" not in caplog.text
     store.close()

@@ -42,6 +42,21 @@ COMPANY_CONTACT_SEARCH = "company_contact_search"
 IRRELEVANT = "irrelevant"
 UNCERTAIN = "uncertain"
 
+# Rule-based output is limited to these six categories, which are also the
+# accepted values of message_classifications.category (the SQLite CHECK).
+RULE_CATEGORIES: Tuple[str, ...] = (
+    REFERRAL_REQUEST,
+    JOB_INTEREST,
+    REFERRAL_OFFER,
+    RECRUITMENT_OFFER,
+    IRRELEVANT,
+    UNCERTAIN,
+)
+
+# Categories accepted by the shared/LLM taxonomy but never emitted by the rule
+# engine or stored in message_classifications.
+AI_ONLY_CATEGORIES: Tuple[str, ...] = (COMPANY_CONTACT_SEARCH,)
+
 CATEGORIES: Tuple[str, ...] = (
     REFERRAL_REQUEST,
     JOB_INTEREST,

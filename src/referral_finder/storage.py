@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
 
 from .classifier import CANDIDATE_CATEGORIES as _CANDIDATE_CATEGORIES
+from .classifier import RULE_CATEGORIES as _RULE_CATEGORIES
 from .models import IncomingMessage
 
 # A fetched row: (chat_id, message_id, date_utc, received_at_utc, text, sender_id).
@@ -28,6 +29,21 @@ Row = Tuple[int, int, int, int, Optional[str], Optional[int]]
 
 # Smallest SQLite INTEGER, used as the initial keyset cursor for pagination.
 _INT64_MIN = -(2 ** 63)
+
+
+def _chat_filter_sql(column: str, chat_ids) -> Tuple[str, tuple]:
+    """Build a parameterised ``AND <column> IN (...)`` fragment.
+
+    ``chat_ids=None`` means no filter (manual backfill/report behavior). An
+    explicitly empty collection means "no chats" and must match no rows.
+    """
+    if chat_ids is None:
+        return "", ()
+    ids = tuple(dict.fromkeys(int(chat_id) for chat_id in chat_ids))
+    if not ids:
+        return "  AND 1 = 0", ()
+    placeholders = ",".join("?" for _ in ids)
+    return f"  AND {column} IN ({placeholders})", ids
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -125,7 +141,8 @@ WHERE chat_id = ? AND message_id = ?
 # Classifier results live in their own table so the source message/text is never
 # duplicated or modified. One row per (message, classifier_version): a new
 # version is written alongside older ones, and re-processing a version is
-# idempotent.
+# idempotent. The CHECK mirrors classifier.RULE_CATEGORIES:
+# company_contact_search is LLM-only and belongs in message_ai_analysis, not here.
 _CLASSIFICATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS message_classifications (
     chat_id            INTEGER NOT NULL,
@@ -287,6 +304,7 @@ LEFT JOIN message_prefilter p
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
   AND (p.chat_id IS NULL OR p.matched = 1)
+{chat_filter}
   AND (m.chat_id, m.message_id) > (?, ?)
 ORDER BY m.chat_id, m.message_id
 LIMIT ?
@@ -308,6 +326,7 @@ LEFT JOIN message_prefilter p
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
   AND (p.chat_id IS NULL OR p.matched = 1)
+{chat_filter}
 """
 
 _SELECT_UNCLASSIFIED = """
@@ -489,6 +508,7 @@ LEFT JOIN message_ai_analysis a
    AND a.prompt_version = ?
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+{chat_filter}
   AND (m.chat_id, m.message_id) > (?, ?)
 ORDER BY m.chat_id, m.message_id
 LIMIT ?
@@ -507,6 +527,7 @@ LEFT JOIN message_ai_analysis a
    AND a.prompt_version = ?
 WHERE m.text IS NOT NULL
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
+{chat_filter}
 """
 
 # Steady selection: only messages strictly newer than the per-chat high-water
@@ -530,6 +551,7 @@ WHERE m.text IS NOT NULL
   AND m.message_id > s.steady_after_message_id
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
   AND (p.chat_id IS NULL OR p.matched = 1)
+{chat_filter}
   AND (m.chat_id, m.message_id) > (?, ?)
 ORDER BY m.chat_id, m.message_id
 LIMIT ?
@@ -554,7 +576,53 @@ WHERE m.text IS NOT NULL
   AND m.message_id > s.steady_after_message_id
   AND (a.chat_id IS NULL OR (a.status != 'ok' AND a.attempts < ?))
   AND (p.chat_id IS NULL OR p.matched = 1)
+{chat_filter}
 """
+
+# Read-only projection used by the report: one row per fixed bootstrap item with
+# the current analysis-version status/category/attempts (NULL when not analysed).
+_SELECT_BOOTSTRAP_ANALYSIS = """
+SELECT b.chat_id, a.status, a.category, a.attempts
+FROM ai_bootstrap_item b
+LEFT JOIN message_ai_analysis a
+    ON a.chat_id = b.chat_id
+   AND a.message_id = b.message_id
+   AND a.provider = ?
+   AND a.model = ?
+   AND a.prompt_version = ?
+ORDER BY b.chat_id, b.message_id
+"""
+
+# Tables/columns the report needs. Validation is read-only (sqlite_master and
+# PRAGMA table_info only): a read-only report must never create or migrate
+# anything, even on an old or unrelated database.
+_REPORT_REQUIRED_SCHEMA = {
+    "ai_bootstrap_state": (
+        "chat_id",
+        "status",
+        "available_count",
+        "selected_count",
+        "steady_after_message_id",
+        "created_at_utc",
+        "updated_at_utc",
+    ),
+    "ai_bootstrap_item": ("chat_id", "message_id"),
+    "message_ai_analysis": (
+        "chat_id",
+        "message_id",
+        "provider",
+        "model",
+        "prompt_version",
+        "status",
+        "category",
+        "attempts",
+    ),
+    "api_request_budget": ("day_utc", "used"),
+}
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """Raised when a read-only consumer finds an unusable database schema."""
 
 
 class MessageStore:
@@ -743,10 +811,21 @@ class MessageStore:
         Each row is ``(chat_id, message_id, classifier_version, category, score,
         matched_rules_json, classified_at_utc)``. Returns the number of new rows
         written; existing (chat_id, message_id, version) rows are left as is.
+        Categories outside :data:`classifier.RULE_CATEGORIES` (including the
+        LLM-only ``company_contact_search``) raise ``ValueError`` before any
+        SQLite write, so they cannot trigger an unhandled IntegrityError.
         """
         rows = list(rows)
         if not rows:
             return 0
+        allowed = set(_RULE_CATEGORIES)
+        for row in rows:
+            category = row[3]
+            if category not in allowed:
+                raise ValueError(
+                    f"category {category!r} is not allowed for "
+                    "rule-based classifications"
+                )
         before = self._conn.total_changes
         self._conn.executemany(_INSERT_CLASSIFICATION, rows)
         self._conn.commit()
@@ -979,23 +1058,29 @@ class MessageStore:
         prompt_version,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         batch_size: int = 500,
+        chat_ids=None,
     ):
         """Yield batches of fixed bootstrap ``(chat_id, message_id, text)``.
 
         No prefilter join: the bootstrap set bypasses prefilter by design. A
         successful AI result is skipped; failures are retried up to
         ``max_attempts``. Keyset-paginated by ``(chat_id, message_id)``.
+        ``chat_ids`` restricts the selection to the configured chats; ``None``
+        keeps the unrestricted behavior used by diagnostics/tests.
         """
+        filter_sql, filter_params = _chat_filter_sql("b.chat_id", chat_ids)
+        sql = _SELECT_AI_BOOTSTRAP.format(chat_filter=filter_sql)
         last_chat = _INT64_MIN
         last_message = _INT64_MIN
         while True:
             rows = self._conn.execute(
-                _SELECT_AI_BOOTSTRAP,
+                sql,
                 (
                     str(provider),
                     str(model),
                     str(prompt_version),
                     int(max_attempts),
+                    *filter_params,
                     last_chat,
                     last_message,
                     int(batch_size),
@@ -1015,14 +1100,38 @@ class MessageStore:
         model,
         prompt_version,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        chat_ids=None,
     ) -> int:
         """Number of bootstrap items still needing analysis for this version."""
+        filter_sql, filter_params = _chat_filter_sql("b.chat_id", chat_ids)
         return int(
             self._conn.execute(
-                _COUNT_AI_BOOTSTRAP,
-                (str(provider), str(model), str(prompt_version), int(max_attempts)),
+                _COUNT_AI_BOOTSTRAP.format(chat_filter=filter_sql),
+                (
+                    str(provider),
+                    str(model),
+                    str(prompt_version),
+                    int(max_attempts),
+                    *filter_params,
+                ),
             ).fetchone()[0]
         )
+
+    def bootstrap_analysis_rows(self, provider, model, prompt_version) -> list:
+        """Read-only rows ``(chat_id, status, category, attempts)`` per item.
+
+        One row per fixed bootstrap item for the given analysis version; a
+        missing AI row yields ``status=None`` (and ``attempts=None``). Derived
+        directly from the stored tables, so the report never keeps its own
+        counters. No message text or identifiers are returned.
+        """
+        return [
+            (int(row[0]), row[1], row[2], None if row[3] is None else int(row[3]))
+            for row in self._conn.execute(
+                _SELECT_BOOTSTRAP_ANALYSIS,
+                (str(provider), str(model), str(prompt_version)),
+            ).fetchall()
+        ]
 
     # --- daily API request budget ------------------------------------------
 
@@ -1090,6 +1199,7 @@ class MessageStore:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         prefilter_version: str = "",
         steady_only: bool = False,
+        chat_ids=None,
     ) -> int:
         """Number of messages still needing AI analysis for this version.
 
@@ -1102,29 +1212,33 @@ class MessageStore:
         With ``steady_only=True`` only messages strictly newer than each chat's
         bootstrap high-water mark are counted (no old history, no bootstrap
         snapshot); chats without a bootstrap state are excluded entirely.
+        ``chat_ids`` optionally restricts the count to the configured chats.
         """
+        filter_sql, filter_params = _chat_filter_sql("m.chat_id", chat_ids)
         if steady_only:
             return int(
                 self._conn.execute(
-                    _COUNT_AI_UNPROCESSED_STEADY,
+                    _COUNT_AI_UNPROCESSED_STEADY.format(chat_filter=filter_sql),
                     (
                         str(provider),
                         str(model),
                         str(prompt_version),
                         str(prefilter_version),
                         int(max_attempts),
+                        *filter_params,
                     ),
                 ).fetchone()[0]
             )
         return int(
             self._conn.execute(
-                _COUNT_AI_UNPROCESSED,
+                _COUNT_AI_UNPROCESSED.format(chat_filter=filter_sql),
                 (
                     str(provider),
                     str(model),
                     str(prompt_version),
                     str(prefilter_version),
                     int(max_attempts),
+                    *filter_params,
                 ),
             ).fetchone()[0]
         )
@@ -1138,6 +1252,7 @@ class MessageStore:
         batch_size: int = 500,
         prefilter_version: str = "",
         steady_only: bool = False,
+        chat_ids=None,
     ):
         """Yield batches of ``(chat_id, message_id, text)`` needing AI analysis.
 
@@ -1149,8 +1264,11 @@ class MessageStore:
         With ``steady_only=True`` only messages strictly newer than each chat's
         bootstrap high-water mark are yielded, so historical messages (including
         those beyond the bootstrap snapshot) can never enter the steady stream.
+        ``chat_ids`` optionally restricts selection to the configured chats.
         """
-        select = _SELECT_AI_UNPROCESSED_STEADY if steady_only else _SELECT_AI_UNPROCESSED
+        select = (_SELECT_AI_UNPROCESSED_STEADY if steady_only else _SELECT_AI_UNPROCESSED)
+        filter_sql, filter_params = _chat_filter_sql("m.chat_id", chat_ids)
+        select = select.format(chat_filter=filter_sql)
         last_chat = _INT64_MIN
         last_message = _INT64_MIN
         while True:
@@ -1162,6 +1280,7 @@ class MessageStore:
                     str(prompt_version),
                     str(prefilter_version),
                     int(max_attempts),
+                    *filter_params,
                     last_chat,
                     last_message,
                     int(batch_size),
@@ -1187,3 +1306,53 @@ class MessageStore:
 
     def __exit__(self, *exc_info) -> None:
         self.close()
+
+
+class ReadOnlyMessageStore(MessageStore):
+    """Read-only view of an existing database (report path).
+
+    Unlike :class:`MessageStore`, this constructor never creates the file,
+    directories, tables, indexes or migrations. The connection uses SQLite
+    ``mode=ro`` plus ``PRAGMA query_only``, so even an accidental write attempt
+    fails instead of silently modifying the user's database.
+    """
+
+    def __init__(self, db_path):
+        self._db_path = Path(db_path)
+        if not self._db_path.exists():
+            raise FileNotFoundError(str(self._db_path))
+
+        self._closed = False
+        uri = self._db_path.resolve().as_uri() + "?mode=ro"
+        self._conn = sqlite3.connect(uri, uri=True)
+        try:
+            self._conn.execute("PRAGMA query_only = ON")
+            self._validate_report_schema()
+        except Exception:
+            self._conn.close()
+            self._closed = True
+            raise
+
+    def _validate_report_schema(self) -> None:
+        """Validate the report schema using only metadata queries (no DDL)."""
+        for table, required_columns in _REPORT_REQUIRED_SCHEMA.items():
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                raise IncompatibleSchemaError(
+                    f"required table is missing: {table}"
+                )
+            existing = {
+                row[1]
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            missing = [
+                column for column in required_columns if column not in existing
+            ]
+            if missing:
+                raise IncompatibleSchemaError(
+                    f"table {table} is missing required column(s): "
+                    + ", ".join(missing)
+                )

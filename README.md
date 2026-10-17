@@ -1,24 +1,33 @@
 # Telegram Referral Lead Finder
 
-A local tool that (in later stages) will monitor selected Telegram chats via
-the official MTProto API (Telethon) and store new messages locally so they can
-be reviewed for courier-job interest.
+A local tool that monitors selected Telegram chats via the official MTProto API
+(Telethon), stores new messages locally, and can optionally analyse them for
+courier-job/referral interest with an opt-in LLM worker.
 
-**Current status: stages 3–8 — SQLite storage, deduplication, pipeline
-robustness, bounded startup history reconciliation, forum-topic support, and a
-rule-based message classifier (offline backfill + optional online hook).**
-New incoming text messages are persisted to SQLite through a bounded queue with
-a single writer; repeated delivery of the same `(chat_id, message_id)` is
-ignored. Messages without text or a caption are skipped. On startup the client
-reconciles recent history for each configured chat to close gaps left while it
-was offline. Chats can be configured by numeric id or by an exact supergroup
-title (`title:`), and messages from forum supergroups store the topic id/title,
-sender information and (when reliably derivable) the message link and a content
-protection flag. Writer failures, DB-write errors, backpressure, lifecycle,
-reconciliation and topic resolution are covered by offline integration tests
-against temporary databases. No live checks are run here: a **real Telegram
-connection is not run by the test suite**. The message text is never written to
-the logs.
+**Current status: stages 3–8, the AI extension A/B1–B4, and privacy/robustness
+fixes D1–D12 are implemented.** SQLite storage, deduplication, bounded startup
+history reconciliation, forum-topic support, the rule-based classifier, the
+optional DeepSeek worker, bootstrap/steady analysis, the shared daily request
+budget, the read-only report, live-backfill and the live smoke command are all
+present.
+
+New incoming text messages are persisted through a bounded queue with a single
+writer; repeated delivery of the same `(chat_id, message_id)` is ignored.
+Messages without text or a caption are skipped. On startup the client reconciles
+recent history for each configured chat to close gaps left while it was offline.
+Chats can be configured by numeric id or by an exact supergroup title (`title:`),
+and messages from forum supergroups store the topic id/title, sender information
+and (when reliably derivable) the message link and a content protection flag.
+Writer failures, DB-write errors, backpressure, lifecycle, reconciliation and
+topic resolution are covered by offline integration tests against temporary
+databases.
+
+AI analysis is **optional and off by default** (`LLM_ENABLED=false`). When
+enabled, it starts only after the Telegram startup/history sync succeeds; if the
+AI configuration, provider or company catalog is unavailable, Telegram
+collection continues without AI. No live Telegram or DeepSeek request is made by
+the test suite. Message text is never written to the logs; normal logs also avoid
+Telegram chat/message IDs.
 
 ## Requirements
 
@@ -31,9 +40,11 @@ the logs.
 
 ```
 config/            chat list (example tracked, real file ignored)
+  companies.yaml   company reference catalog
 src/referral_finder/
   __init__.py
   __main__.py          entry point (runs the client + storage lifecycle)
+  app.py               Telegram + optional AI worker lifecycle wiring
   config.py            env + chats.txt loading and validation
   logging_setup.py     logging with secret masking
   models.py            message DTO (Telethon-independent shape)
@@ -43,7 +54,22 @@ src/referral_finder/
   topics.py            forum topic title resolution and caching
   classifier.py        rule-based message classifier (pure)
   classify.py          post-persist service + offline backfill CLI
+  companies.py         company catalog loading and person-search matching
   telegram_client.py   Telethon client, incoming handler, lifecycle
+  llm/
+    base.py            provider interface and errors
+    budget.py          persistent UTC daily HTTP-request budget
+    bootstrap.py       bootstrap snapshot + steady worker
+    cli.py             offline pipeline check / live historical backfill
+    deepseek.py        DeepSeek HTTP adapter
+    factory.py         provider construction from configuration
+    fake.py            deterministic offline provider
+    prompt.py          prompt version/hash
+    report.py          bootstrap-only, read-only AI report
+    schema.py          analysis result contract
+    service.py         prefilter → scrub → provider → storage pipeline
+    smoke.py           one-message live smoke command
+    versioning.py      effective analysis version
 tests/unit/        unit + integration tests (no Telegram, no network)
 tests/data/        synthetic classifier examples (no real messages)
 ```
@@ -75,16 +101,16 @@ the chat is unprotected.
 
 The inbound handler queues text messages into a bounded `asyncio.Queue`
 (default size 1000) drained by a single background writer, so only one
-coroutine ever writes to SQLite. Persistence errors are logged (with the
-identifiers only, never the text) and are never reported as success.
+coroutine ever writes to SQLite. Persistence errors are logged without message
+text or Telegram identifiers and are never reported as success.
 
 Shutdown order is deliberate: the Telegram client is **disconnected first**
 (Telethon cancels and awaits in-flight handler tasks, so no new message can be
 submitted), then the writer is stopped and the already-accepted queue is drained,
 and only then is the SQLite connection closed. Messages that were still in a
-handler when the client disconnected are dropped and logged (identifiers only).
-Each shutdown step is isolated so one failing component does not block the
-others.
+handler when the client disconnected are dropped and logged without message
+text or Telegram identifiers. Each shutdown step is isolated so one failing
+component does not block the others.
 
 If the background writer task dies unexpectedly, the failure is recorded and
 surfaced: `submit()` raises `MessageWriterError` instead of blocking forever on
@@ -159,41 +185,126 @@ Online classification is **off by default**:
 |---|---|---|
 | `CLASSIFY_ON_INGEST` | no | `true`/`1`/`on` to classify each successfully saved message (default `false`) |
 
-**AI classification (offline preparation).** A provider-agnostic LLM layer is
-scaffolded but not wired into the collector and performs **no** network calls.
-The intended flow is: `prefilter` → best-effort `scrubbing` → provider. The
-DeepSeek adapter is prepared with an injectable HTTP transport and is covered by
-offline tests only. Online calls stay off until explicitly enabled:
+**AI classification (optional, opt-in).** When `LLM_ENABLED=true`, the app
+starts a background AI worker after Telegram has connected and the startup
+history reconciliation has completed. The steady flow is `prefilter` →
+`scrubbing` → provider; the bootstrap snapshot bypasses the prefilter but is
+still scrubbed before it reaches the provider. A provider or catalog problem
+skips the AI worker and leaves Telegram collection running. Online calls are off
+unless explicitly enabled:
 
 | Variable | Required | Description |
 |---|---|---|
-| `LLM_ENABLED` | no | master switch for real AI calls (default `false`) |
+| `LLM_ENABLED` | no | master switch for AI analysis (default `false`) |
 | `LLM_PROVIDER` | no | provider key (default `deepseek`) |
 | `LLM_MODEL` | no | model id (default `deepseek-flash`) |
 | `LLM_BASE_URL` | no | API base URL (default `https://api.deepseek.com`) |
 | `DEEPSEEK_API_KEY` | no | real key for DeepSeek, read **only** from the environment; never logged or committed |
-| `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | no | request timeout / bounded retries |
-| `LLM_MAX_INPUT_CHARS` / `LLM_MAX_OUTPUT_TOKENS` | no | input/output bounds |
+| `LLM_CRITERIA` | no | search criteria included in the analysis identity and prompt |
+| `LLM_MAX_API_REQUESTS_PER_DAY` | no | shared daily limit for outgoing HTTP requests, counted in UTC (default `10000`) |
+| `LLM_BOOTSTRAP_LIMIT` | no | per-chat bootstrap snapshot size (default `200` text messages) |
+| `LLM_POLL_INTERVAL` | no | steady worker poll interval in seconds (default `5.0`) |
+| `LLM_BATCH_SIZE` | no | maximum messages selected per worker cycle (default `25`) |
+| `LLM_MAX_ATTEMPTS` | no | maximum recorded attempts per message/version (default `3`) |
+| `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | no | request timeout / bounded retries (defaults `30.0` / `2`) |
+| `LLM_MAX_INPUT_CHARS` / `LLM_MAX_OUTPUT_TOKENS` | no | input/output bounds (defaults `4000` / `400`) |
+
+`LLM_ENABLED=true` with the default DeepSeek provider requires
+`DEEPSEEK_API_KEY`; otherwise the AI worker is skipped. The daily budget is
+shared by bootstrap, steady analysis, live backfill and the smoke command, and
+each actual HTTP attempt (including retries) reserves one unit before it is sent.
+
+The analysis identity (stored in the `prompt_version` column) is the effective
+version: the prompt template version plus a hash of the normalized search
+criteria, so changing `LLM_CRITERIA` (or `--criteria`) yields a distinct result
+instead of reusing an old one. A successful result is never re-requested; a
+temporary failure is retried a bounded number of times.
+
+`company_contact_search` is an LLM-only **weak** signal: it means the author is
+looking for a person/employee/acquaintance connected to a company, not that a
+job or referral lead is confirmed. The rule-based classifier keeps its six
+categories and never emits this category.
 
 Scrubbing is best-effort and does **not** guarantee anonymization (names and
 other sensitive content may remain). See `SPEC.md` SEC-5.1–SEC-5.7.
 
-The analysis identity (stored in the `prompt_version` column) is the effective
-version: the prompt template version plus a hash of the normalized search
-criteria, so changing `--criteria` yields a distinct result instead of reusing
-an old one. A successful result is never re-requested; a temporary failure is
-retried a bounded number of times (`--max-attempts`, default 3).
+### AI bootstrap and steady analysis
 
-Offline pipeline check (FakeProvider, no network) and a single live smoke test:
+When AI is enabled, startup proceeds in this order:
+
+1. Telegram connects, catches up, and runs the bounded startup history
+   reconciliation. Only chats with a confirmed successful sync are considered
+   ready for AI.
+2. For each ready chat the app fixes a **bootstrap snapshot**: up to
+   `LLM_BOOTSTRAP_LIMIT` most recent text messages (default `200` per chat).
+   The snapshot is persisted and idempotent across restarts. It bypasses the
+   prefilter but is still scrubbed before the provider call.
+3. Bootstrap items are analysed first. Only after the bootstrap phase completes
+   does the **steady** phase start for that worker.
+4. Steady processes only messages with `message_id` strictly greater than the
+   chat's saved bootstrap watermark, through the normal prefilter and company
+   catalog. New messages arriving during bootstrap are not lost; messages older
+   than the fixed snapshot are not automatically analysed.
+5. If history sync for a chat is missing or incomplete, no bootstrap snapshot or
+   watermark is created for that chat; it can be picked up on a later successful
+   startup. An exhausted daily budget stops the current phase and leaves the
+   queue for the next UTC day.
+
+### Company catalog
+
+The prefilter can use `config/companies.yaml` to recognise company spellings and
+person/employee search phrases. The catalog path is resolved in this order:
+explicit `--companies` (CLI), then `TG_COMPANIES_FILE`, then the repository's
+`config/companies.yaml`. A missing or malformed catalog is a hard error rather
+than an empty fallback. A bare company mention is not treated as a person search.
+
+Offline pipeline check (FakeProvider, no network, explicit test DB):
 
 ```
-.\.venv\Scripts\python -m referral_finder.llm.cli --db <test.db> [--dry-run] [--limit N]
+.\.venv\Scripts\python -m referral_finder.llm.cli --db <test.db> [--dry-run] [--limit N] [--batch-size N] [--max-attempts N] [--criteria TEXT] [--companies PATH]
+```
+
+Live historical backfill is a separate, explicitly confirmed operation:
+
+```
 $env:LLM_ENABLED="true"; $env:DEEPSEEK_API_KEY="<key>"
-.\.venv\Scripts\python -m referral_finder.llm.smoke --live
+.\.venv\Scripts\python -m referral_finder.llm.cli --live --include-history --limit N --db <existing.db> [--criteria TEXT] [--companies PATH]
 ```
 
-The smoke test sends exactly one built-in synthetic message; it never runs from
-the test suite or at application start.
+It requires `--live`, `--include-history`, a positive `--limit`, an existing
+`--db`, `LLM_ENABLED=true`, `DEEPSEEK_API_KEY`, a real provider (not
+`fake`/`none`) and the shared daily budget. It can make **paid external
+DeepSeek requests**; no automatic historical backfill runs at startup.
+`--include-history` without `--live` and `--live` without `--include-history`
+are rejected.
+
+Single live smoke test:
+
+```
+$env:LLM_ENABLED="true"; $env:DEEPSEEK_API_KEY="<key>"
+.\.venv\Scripts\python -m referral_finder.llm.smoke --live --db <existing.db> [--criteria TEXT] [--model MODEL]
+```
+
+The smoke test sends exactly one built-in synthetic message, never a user
+message. It requires `--live`, `--db` pointing at an existing database (the
+shared budget store), `LLM_ENABLED=true` and `DEEPSEEK_API_KEY`, and can make a
+**paid external request**. It never runs from the test suite or at application
+start.
+
+Bootstrap-only, read-only AI report:
+
+```
+.\.venv\Scripts\python -m referral_finder.llm.report --db <existing.db> [--provider PROVIDER] [--model MODEL] [--prompt-version VERSION] [--criteria TEXT] [--budget-limit N] [--max-attempts N] [--chats IDS] [--json]
+```
+
+The report only opens an existing database in read-only mode; it never creates
+or migrates it. It covers only the fixed bootstrap snapshot/queue and does not
+include messages processed exclusively in steady. Output uses temporary
+`chat_1`, `chat_2`, ... labels instead of real Telegram IDs. `pending` includes
+unprocessed items and retryable `invalid`/`error` items, so `pending`,
+`invalid` and `error` may overlap and must not be summed as disjoint
+categories. To match the application's analysis version, pass the same
+`--criteria` (and provider/model/prompt version, if overridden) used by the app.
 
 When enabled, classification runs as a post-persist hook inside the single
 writer; a classifier error is logged and does **not** stop collection. Backfill
@@ -237,9 +348,10 @@ no explicit environment mapping is provided.
    ```
    Copy-Item .env.example .env
    ```
-2. Fill in real values in `.env`. Real credentials are only needed from
-   stage 2 (Telegram connection); stage 1 tests and the skeleton run without
-   them.
+2. Fill in real values in `.env`. Telegram credentials are required to run the
+   collector; the offline test suite does not need them. AI is enabled
+   separately and additionally requires `DEEPSEEK_API_KEY` when the DeepSeek
+   provider is used.
 
 Variables:
 
@@ -251,6 +363,12 @@ Variables:
 | `DB_PATH` | no | SQLite path (default `data/messages.db`) |
 | `LOG_LEVEL` | no | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` (default `INFO`) |
 | `TG_CHATS_FILE` | no | Chat list path (default `config/chats.txt`) |
+| `TG_COMPANIES_FILE` | no | Explicit company catalog path; overrides the repository default `config/companies.yaml` but not CLI `--companies` |
+| `CLASSIFY_ON_INGEST` | no | `true`/`1`/`on` to run the rule-based classifier on each saved message (default `false`) |
+| `LLM_*` / `DEEPSEEK_API_KEY` | no | AI settings are listed in the AI classification section above |
+
+The live AI commands also load `.env` (via `resolve_environment`) when no explicit
+environment mapping is supplied; offline checks keep their explicit environment.
 
 ### Chat list
 
@@ -287,6 +405,12 @@ messages are written to SQLite; repeated delivery of the same message is
 ignored. Forum supergroups are subscribed by parent chat id (all topics at
 once), and each message keeps its topic id/title.
 
+If `LLM_ENABLED=true`, the optional AI worker is started after that startup
+sync. It snapshots the successfully synchronised chats, processes the bootstrap
+snapshot, then switches to steady analysis for newer messages. If AI cannot be
+initialised, Telegram collection continues. See the AI bootstrap/steady section
+for the exact sequence and the shared UTC budget.
+
 The database (and its parent directory) is created only when the command runs,
 i.e. only with a configured `DB_PATH`. Set `DB_PATH` to a path **outside the
 repository** (the default `data/messages.db` is git-ignored only as a safety
@@ -297,9 +421,10 @@ net).
 > first use. That live check is performed separately, after explicit approval.
 > First-time login is interactive; subsequent runs reuse the session file.
 
-The handler logs only technical identifiers (`chat_id`, `message_id`,
-`date_utc`, `text_length`, `topic_id`, and whether the topic title is known). It
-never logs the message text.
+The handler logs only non-identifying technical details (message date, text
+length, whether a topic was resolved and whether its title is known). It never
+logs chat IDs, message IDs, message text, usernames or links. Other operational
+logs likewise report operation/result/counts/error type without Telegram IDs.
 
 ## Tests
 
@@ -312,8 +437,9 @@ and temporary SQLite databases under `tmp_path`. They never read or write the
 developer's real `.env`, `config/chats.txt`, session file, or database, and they
 require no Telegram credentials.
 
-Live tests (marked `live`) are excluded by default and will only be added and
-run on later stages, with explicit approval.
+Live network tests are excluded from the default suite (`-m 'not live'`). The
+manual live smoke and live-backfill commands are separate and require explicit
+configuration and approval; they are never run by the test suite.
 
 ## Security
 
@@ -321,4 +447,10 @@ run on later stages, with explicit approval.
   database. `.gitignore` enforces this as a safety net.
 - The session file grants full access to the account; keep it outside the
   repository.
-- Logs mask known secret values (API hash, session path).
+- Logs mask known secret values (API hash, session path) and do not contain
+  message text or Telegram chat/message IDs.
+- AI is opt-in. When enabled, scrubbed message text may be sent to DeepSeek;
+  scrubbing is best-effort and is not a guarantee of anonymization. Outgoing
+  requests are bounded by the shared daily budget.
+- The report is read-only and uses temporary `chat_1`, `chat_2`, ... labels
+  instead of real Telegram IDs.

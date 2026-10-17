@@ -1,8 +1,8 @@
 """One-message live smoke test for the DeepSeek API.
 
-Deliberately separate from the pipeline and the collector: it always analyses a
-single built-in synthetic message and never touches Telegram, SQLite, or user
-data. A real HTTP call happens **only** when ``--live`` is passed *and*
+It analyses one synthetic message and never reads stored messages or Telegram history.
+SQLite is used only for the shared daily API budget when running live. A real HTTP
+call happens **only** when ``--live`` is passed *and*
 ``LLM_ENABLED=true`` *and* ``DEEPSEEK_API_KEY`` is present in the environment.
 
 Safety properties:
@@ -16,10 +16,11 @@ Safety properties:
 * The message still flows through ``scrub`` before the provider sees it, and no
   Telegram identifiers/links/metadata are attached.
 * The summary shows the model, criteria version and the *planned* request count
-  (``requests_planned=1``); ``requests=1`` is only printed once the provider call
-  has actually completed (success or handled error). The result prints only the
-  validated category, relevance, status and usage. The full request and raw
-  provider response are never printed.
+  (``requests_planned=1``). ``requests=N`` reports actual transport attempts; a
+  budget refusal before the transport is called prints ``requests=0`` with
+  ``status=budget_exhausted``. The result prints only the validated category,
+  relevance, status and usage. The full request and raw provider response are
+  never printed.
 """
 
 from __future__ import annotations
@@ -28,18 +29,34 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from ..config import DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY
+from ..config import (
+    DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY,
+    ConfigError,
+    resolve_environment,
+    resolve_llm_max_api_requests_per_day,
+)
 from ..logging_setup import register_secret
 from ..prefilter import prefilter
 from ..scrubbing import scrub
 from ..storage import MessageStore
-from .base import LLMConfigError, LLMError, LLMRequest
+from .base import (
+    LLMBudgetExceededError,
+    LLMConfigError,
+    LLMError,
+    LLMRequest,
+)
 from .budget import ApiRequestBudget
-from .deepseek import DEFAULT_BASE_URL, DeepSeekProvider, HttpTransport
+from .deepseek import (
+    DEFAULT_BASE_URL,
+    DeepSeekProvider,
+    HttpTransport,
+    UrllibHttpTransport,
+)
 from .factory import DEEPSEEK_API_KEY_ENV
 from .versioning import effective_analysis_version
 
@@ -88,16 +105,22 @@ def _env_enabled(env: Mapping[str, str]) -> bool:
 
 
 def _limit_from_env(env: Mapping[str, str]) -> int:
-    raw = env.get("LLM_MAX_API_REQUESTS_PER_DAY")
-    if raw is None or not str(raw).strip():
-        return DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY
     try:
-        value = int(str(raw).strip())
-    except ValueError as exc:
-        raise LLMConfigError("LLM_MAX_API_REQUESTS_PER_DAY must be an integer") from exc
-    if value < 1:
-        raise LLMConfigError("LLM_MAX_API_REQUESTS_PER_DAY must be at least 1")
-    return value
+        return resolve_llm_max_api_requests_per_day(env)
+    except ConfigError as exc:
+        raise LLMConfigError(str(exc)) from exc
+
+
+class _CountingTransport:
+    """Count actual transport calls without changing the HTTP behavior."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    async def send(self, request):
+        self.calls += 1
+        return await self._inner.send(request)
 
 
 def _build_live_provider(env: Mapping[str, str], model: str, transport, store):
@@ -105,18 +128,26 @@ def _build_live_provider(env: Mapping[str, str], model: str, transport, store):
     register_secret(api_key)
     base_url = env.get("LLM_BASE_URL") or DEFAULT_BASE_URL
     budget = ApiRequestBudget(store, _limit_from_env(env))
-    return DeepSeekProvider(
+    counter = _CountingTransport(
+        transport if transport is not None else UrllibHttpTransport()
+    )
+    provider = DeepSeekProvider(
         api_key=api_key,
         model=model,
         base_url=base_url,
-        transport=transport,
+        transport=counter,
         max_input_chars=_MAX_INPUT_CHARS,
         max_output_tokens=_MAX_OUTPUT_TOKENS,
         budget=budget,
     )
+    return provider, counter
 
 
-def _analyze(provider, args) -> int:
+def _request_count(counter, fallback: int) -> int:
+    return counter.calls if counter is not None else fallback
+
+
+def _analyze(provider, args, *, requests_counter=None) -> int:
     version = effective_analysis_version(provider.prompt_version, args.criteria)
     print(
         f"live=1 model={provider.model} criteria_version={version} "
@@ -132,18 +163,43 @@ def _analyze(provider, args) -> int:
 
     try:
         result = asyncio.run(provider.analyze(request))
+    except LLMBudgetExceededError as exc:
+        # A budget refusal before the transport is not a sent request. If the
+        # budget was exhausted during a retry, the counter still reports the
+        # HTTP attempts that actually happened.
+        print(
+            "status=budget_exhausted "
+            f"error={type(exc).__name__} "
+            f"requests={_request_count(requests_counter, 0)}"
+        )
+        return 1
+    except sqlite3.Error as exc:
+        # A store error can also happen while reserving a retry, after one or
+        # more real HTTP attempts; report the transport's actual count.
+        print(
+            f"status=error error={type(exc).__name__} "
+            f"requests={_request_count(requests_counter, 0)}"
+        )
+        return 2
     except LLMError as exc:
         # Only the error type, never the key or the request/response body. The
         # call was attempted, so it is counted, but the error status makes it
         # clear that no successful response was obtained.
-        print(f"status=error error={type(exc).__name__} requests=1")
+        print(
+            f"status=error error={type(exc).__name__} "
+            f"requests={_request_count(requests_counter, 1)}"
+        )
         return 1
     except Exception as exc:  # noqa: BLE001 - report type only, no details
-        print(f"status=error error={type(exc).__name__} requests=1")
+        print(
+            f"status=error error={type(exc).__name__} "
+            f"requests={_request_count(requests_counter, 1)}"
+        )
         return 1
 
     print(
-        f"status=ok category={result.category} relevant={result.relevant} requests=1"
+        f"status=ok category={result.category} relevant={result.relevant} "
+        f"requests={_request_count(requests_counter, 1)}"
     )
     usage = getattr(provider, "last_usage", None)
     if usage is not None:
@@ -159,7 +215,12 @@ def run(
     provider=None,
 ) -> int:
     args = _build_parser().parse_args(argv)
-    env = os.environ if env is None else env
+    if args.live and provider is None:
+        # Same source as the application (including a local .env); no Telegram
+        # credentials are required by this command.
+        env = resolve_environment(env)
+    else:
+        env = os.environ if env is None else env
     model = args.model or env.get("LLM_MODEL") or DEFAULT_MODEL
 
     if not args.live:
@@ -186,14 +247,25 @@ def run(
         print("error=budget database not found; no request sent", file=sys.stderr)
         return 2
 
-    store = MessageStore(db_path)
+    try:
+        store = MessageStore(db_path)
+    except (sqlite3.Error, OSError) as exc:
+        print(
+            "error=budget database could not be opened "
+            f"({type(exc).__name__}); no request sent",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         try:
-            provider = _build_live_provider(env, model, transport, store)
+            provider, requests_counter = _build_live_provider(
+                env, model, transport, store
+            )
         except LLMConfigError as exc:
             print(f"error={exc}", file=sys.stderr)
             return 2
-        return _analyze(provider, args)
+        return _analyze(provider, args, requests_counter=requests_counter)
     finally:
         store.close()
 

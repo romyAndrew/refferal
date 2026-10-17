@@ -18,6 +18,7 @@ from .base import (
     LLMTimeoutError,
 )
 from .budget import ApiRequestBudget, utc_day
+from .bootstrap import BootstrapSteadyWorker
 from .factory import DEEPSEEK_API_KEY_ENV, provider_from_config
 from .fake import FakeProvider
 from .deepseek import (
@@ -28,6 +29,7 @@ from .deepseek import (
     UrllibHttpTransport,
 )
 from .prompt import PROMPT_HASH, PROMPT_VERSION, build_messages
+from .report import build_report, format_report
 from .service import (
     STATUS_BUDGET_EXHAUSTED,
     STATUS_DISABLED,
@@ -58,6 +60,7 @@ __all__ = [
     "AnalysisOutcome",
     "AnalysisResult",
     "ApiRequestBudget",
+    "BootstrapSteadyWorker",
     "DEEPSEEK_API_KEY_ENV",
     "DeepSeekProvider",
     "FakeProvider",
@@ -92,7 +95,9 @@ __all__ = [
     "ValidationError",
     "ai_analysis_row",
     "build_messages",
+    "build_report",
     "expected_relevant",
+    "format_report",
     "provider_from_config",
     "utc_day",
     "validate_analysis",

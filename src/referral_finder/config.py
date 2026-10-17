@@ -49,6 +49,10 @@ DEFAULT_LLM_MAX_ATTEMPTS = 3
 # bootstrap, the steady worker, manual backfill and the smoke command).
 DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY = 10000
 
+# Number of most recent text messages captured as the fixed per-chat bootstrap
+# snapshot (analysed without prefilter; older history is never auto-analysed).
+DEFAULT_LLM_BOOTSTRAP_LIMIT = 200
+
 REQUIRED_VARS = ("TG_API_ID", "TG_API_HASH", "TG_SESSION_PATH")
 
 TITLE_PREFIX = "title:"
@@ -161,6 +165,7 @@ class Config:
     llm_batch_size: int = DEFAULT_LLM_BATCH_SIZE
     llm_max_attempts: int = DEFAULT_LLM_MAX_ATTEMPTS
     llm_max_api_requests_per_day: int = DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY
+    llm_bootstrap_limit: int = DEFAULT_LLM_BOOTSTRAP_LIMIT
 
     def safe_repr(self) -> str:
         """Representation that never exposes the API hash or the LLM key."""
@@ -197,6 +202,33 @@ def _require(env: Mapping[str, str], key: str) -> str:
     return value
 
 
+def resolve_environment(
+    env: Optional[Mapping[str, str]] = None, *, env_file: Optional[str] = None
+) -> Mapping[str, str]:
+    """Return an explicit environment or load the local ``.env`` source.
+
+    Live commands use this without requiring Telegram credentials: it only
+    resolves the environment mapping, while :func:`load_config` has its own
+    Telegram validation.
+    """
+    if env is not None:
+        return env
+    if load_dotenv is not None:
+        load_dotenv(env_file)
+    return os.environ
+
+
+def resolve_llm_max_api_requests_per_day(env: Mapping[str, str]) -> int:
+    """Single validated source for the shared daily HTTP-request limit."""
+    value = _as_int(
+        _get(env, "LLM_MAX_API_REQUESTS_PER_DAY"),
+        DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY,
+    )
+    if value < 1:
+        raise ConfigError("LLM_MAX_API_REQUESTS_PER_DAY must be at least 1")
+    return value
+
+
 def parse_chats_file(path: Path) -> Tuple[str, ...]:
     """Read chat identifiers, one per line.
 
@@ -227,9 +259,7 @@ def load_config(
     ``.env`` loading entirely, so tests never touch real local settings.
     """
     if env is None:
-        if load_dotenv is not None:
-            load_dotenv(env_file)
-        env = os.environ
+        env = resolve_environment(env_file=env_file)
 
     raw_api_id = _require(env, "TG_API_ID")
     try:
@@ -280,12 +310,13 @@ def load_config(
     if llm_max_attempts < 1:
         raise ConfigError("LLM_MAX_ATTEMPTS must be at least 1")
 
-    llm_max_api_requests_per_day = _as_int(
-        _get(env, "LLM_MAX_API_REQUESTS_PER_DAY"),
-        DEFAULT_LLM_MAX_API_REQUESTS_PER_DAY,
+    llm_max_api_requests_per_day = resolve_llm_max_api_requests_per_day(env)
+
+    llm_bootstrap_limit = _as_int(
+        _get(env, "LLM_BOOTSTRAP_LIMIT"), DEFAULT_LLM_BOOTSTRAP_LIMIT
     )
-    if llm_max_api_requests_per_day < 1:
-        raise ConfigError("LLM_MAX_API_REQUESTS_PER_DAY must be at least 1")
+    if llm_bootstrap_limit < 1:
+        raise ConfigError("LLM_BOOTSTRAP_LIMIT must be at least 1")
 
     if chats_file is not None:
         chats_path = Path(chats_file).expanduser()
@@ -317,4 +348,5 @@ def load_config(
         llm_batch_size=llm_batch_size,
         llm_max_attempts=llm_max_attempts,
         llm_max_api_requests_per_day=llm_max_api_requests_per_day,
+        llm_bootstrap_limit=llm_bootstrap_limit,
     )

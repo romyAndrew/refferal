@@ -165,9 +165,10 @@ async def test_handler_logs_technical_record_without_full_text(caplog):
     with caplog.at_level(logging.INFO, logger="referral_finder.telegram_client"):
         await handle_new_message(event)
 
-    assert "chat_id=-1001234567890" in caplog.text
-    assert "message_id=42" in caplog.text
+    assert "chat_id=-1001234567890" not in caplog.text
+    assert "message_id=42" not in caplog.text
     assert "text_length=19" in caplog.text
+    assert "topic_resolved=" in caplog.text
     assert "SECRET MESSAGE TEXT" not in caplog.text
 
 

@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-from ..prefilter import effective_prefilter_version, prefilter
+from ..prefilter import PrefilterResult, effective_prefilter_version, prefilter
 from ..scrubbing import scrub
 from ..storage import MessageStore
 from .base import (
@@ -100,10 +100,22 @@ class MessageAnalysisService:
         self._clock = clock or (lambda: int(time.time()))
         self._catalog = catalog
 
-    async def analyze(self, chat_id: int, message_id: int, text: str) -> AnalysisOutcome:
+    async def analyze(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        bypass_prefilter: bool = False,
+    ) -> AnalysisOutcome:
         """Analyse one message and persist the outcome.
 
         The local key (``chat_id``, ``message_id``) is used only for storage.
+
+        With ``bypass_prefilter=True`` the prefilter gate is skipped entirely
+        (and no prefilter decision is recorded), but the text is still scrubbed
+        before the provider sees it. This is used by the fixed bootstrap
+        snapshot, which is deliberately evaluated in full.
         """
         if not self._enabled:
             return AnalysisOutcome(STATUS_DISABLED)
@@ -112,14 +124,17 @@ class MessageAnalysisService:
         if self._existing_success(chat_id, message_id):
             return AnalysisOutcome(STATUS_DUPLICATE, matched=True)
 
-        gate = prefilter(text, self._catalog)
-        self._record_prefilter(chat_id, message_id, gate)
-        if not gate.matched:
-            return AnalysisOutcome(
-                STATUS_PREFILTER_SKIPPED,
-                matched=False,
-                prefilter_rules=gate.rule_ids,
-            )
+        if bypass_prefilter:
+            gate = PrefilterResult(True, ())
+        else:
+            gate = prefilter(text, self._catalog)
+            self._record_prefilter(chat_id, message_id, gate)
+            if not gate.matched:
+                return AnalysisOutcome(
+                    STATUS_PREFILTER_SKIPPED,
+                    matched=False,
+                    prefilter_rules=gate.rule_ids,
+                )
 
         scrubbed = scrub(text)
         request = LLMRequest(text=scrubbed.text, criteria=self._criteria)

@@ -4,9 +4,11 @@ import contextlib
 import io
 import json
 import logging
+import sqlite3
 
 from referral_finder.classifier import JOB_INTEREST
 from referral_finder.llm import AnalysisResult, FakeProvider, HttpResponse, LLMRequest
+from referral_finder.llm import smoke as smoke_module
 from referral_finder.llm.factory import DEEPSEEK_API_KEY_ENV
 from referral_finder.llm.smoke import SMOKE_MESSAGE, run
 from referral_finder.logging_setup import setup_logging
@@ -119,6 +121,34 @@ def _chat_response(content, usage=None):
     return HttpResponse(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
+def test_sqlite_error_after_transport_reports_one_request():
+    transport = smoke_module._CountingTransport(
+        FakeTransport(_chat_response("{}"))
+    )
+
+    class AfterTransportSQLiteError:
+        prompt_version = "test-prompt"
+        model = "test-model"
+
+        async def analyze(self, request):
+            await transport.send(request)
+            raise sqlite3.Error("store failed")
+
+    args = smoke_module._build_parser().parse_args(["--live"])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = smoke_module._analyze(
+            AfterTransportSQLiteError(), args, requests_counter=transport
+        )
+
+    text = out.getvalue()
+    assert rc == 2
+    assert transport.calls == 1
+    assert "status=error" in text
+    assert "requests=1" in text
+    assert "requests=0" not in text
+
+
 def test_live_path_uses_real_provider_and_sends_no_metadata(tmp_path):
     content = json.dumps(
         {
@@ -198,6 +228,35 @@ def test_live_with_missing_db_file_sends_nothing(tmp_path):
     assert not missing.exists()  # never silently creates a fresh budget DB
 
 
+def test_live_unreadable_database_sends_nothing(tmp_path):
+    db = tmp_path / "corrupt.db"
+    db.write_bytes(b"not a sqlite database")
+    transport = FakeTransport(_chat_response("{}"))
+    env = {"LLM_ENABLED": "true", DEEPSEEK_API_KEY_ENV: "SMOKEKEY123"}
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert run(["--live", "--db", str(db)], env=env, transport=transport) == 2
+    assert "budget database could not be opened" in err.getvalue()
+    assert transport.requests == []
+
+
+def test_live_invalid_daily_limit_sends_nothing(tmp_path):
+    db = tmp_path / "budget.db"
+    with MessageStore(db):
+        pass
+    transport = FakeTransport(_chat_response("{}"))
+    env = {
+        "LLM_ENABLED": "true",
+        DEEPSEEK_API_KEY_ENV: "SMOKEKEY123",
+        "LLM_MAX_API_REQUESTS_PER_DAY": "0",
+    }
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert run(["--live", "--db", str(db)], env=env, transport=transport) == 2
+    assert "LLM_MAX_API_REQUESTS_PER_DAY" in err.getvalue()
+    assert transport.requests == []
+
+
 def test_live_respects_daily_budget(tmp_path, capsys):
     db = tmp_path / "budget.db"
     with MessageStore(db):
@@ -218,5 +277,8 @@ def test_live_respects_daily_budget(tmp_path, capsys):
     # The second live run cannot reserve the daily budget: no HTTP request.
     assert run(["--live", "--db", str(db)], env=env, transport=transport) == 1
     out = capsys.readouterr().out
+    assert "status=budget_exhausted" in out
     assert "error=LLMBudgetExceededError" in out
+    assert "requests=0" in out
+    assert "requests=1" not in out
     assert len(transport.requests) == 1

@@ -4,8 +4,8 @@ No Telegram/network access happens at import time; a connection is only opened
 when :meth:`TelegramRunner.start` / :meth:`TelegramRunner.run_forever` is
 explicitly awaited.
 
-The handler emits a minimal technical log record (chat id, message id,
-timestamp, text length) and deliberately keeps the message text out of the logs.
+The handler logs only the timestamp, text length, and topic status.
+Chat and message IDs and message text are deliberately excluded from logs.
 When a :class:`~referral_finder.ingest.MessageWriter` is attached, text-bearing
 messages are also forwarded to it for persistence; messages without text or a
 caption are skipped. No media is downloaded and no extra profile data is
@@ -126,36 +126,23 @@ async def handle_new_message(
 
     record = to_log_record(message)
     logger.info(
-        "New message: chat_id=%s message_id=%s date_utc=%s text_length=%s "
-        "topic_id=%s topic_title_known=%s",
-        record.chat_id,
-        record.message_id,
+        "New message: date_utc=%s text_length=%s topic_resolved=%s "
+        "topic_title_known=%s",
         record.date_utc,
         record.text_length,
-        message.topic_id,
+        message.topic_id is not None,
         message.topic_title is not None,
     )
     if message.topic_id is not None:
         logger.debug(
-            "Topic resolved: chat_id=%s message_id=%s topic_id=%s topic_title_known=%s",
-            message.chat_id,
-            message.message_id,
-            message.topic_id,
+            "Topic resolved: topic_title_known=%s",
             message.topic_title is not None,
         )
     elif chat_entity is not None and getattr(chat_entity, "forum", False):
-        logger.warning(
-            "Forum message without a topic id: chat_id=%s message_id=%s",
-            message.chat_id,
-            message.message_id,
-        )
+        logger.warning("Forum message without a topic id")
 
     if message.text is None:
-        logger.debug(
-            "Skipping message without text chat_id=%s message_id=%s",
-            message.chat_id,
-            message.message_id,
-        )
+        logger.debug("Skipping message without text")
         return
 
     if writer is None:
@@ -166,22 +153,12 @@ async def handle_new_message(
         await writer.submit(message)
     except MessageWriterError:
         # The writer has failed or stopped; the message cannot be persisted.
-        # Log it explicitly (identifiers only) so the loss is not silent.
-        logger.exception(
-            "Message writer unavailable; message not persisted "
-            "chat_id=%s message_id=%s",
-            message.chat_id,
-            message.message_id,
-        )
+        # Log it explicitly (without Telegram identifiers) so it is not silent.
+        logger.exception("Message writer unavailable; message not persisted")
     except asyncio.CancelledError:
         # Telethon cancels in-flight handler tasks on disconnect. The message
-        # was not queued; log it (identifiers only) and propagate cancellation.
-        logger.warning(
-            "Message handling cancelled during shutdown; message not persisted "
-            "chat_id=%s message_id=%s",
-            message.chat_id,
-            message.message_id,
-        )
+        # was not queued; log it (without identifiers) and propagate.
+        logger.warning("Message handling cancelled during shutdown; message not persisted")
         raise
 
 
@@ -231,6 +208,9 @@ class TelegramRunner:
         self._store = store
         self._history_sync = history_sync
         self._registered = False
+        # Per-chat history-sync outcomes from the most recent start(). Empty
+        # when history sync is disabled.
+        self._history_results = ()
         # chat_id -> resolved Telegram entity. Captured by reference in the
         # handler, so entities resolved after registration remain visible.
         self._entities_by_chat_id: dict = {}
@@ -251,6 +231,37 @@ class TelegramRunner:
             if chat_id not in ids:
                 ids.append(chat_id)
         return tuple(ids)
+
+    def configured_chat_ids(self):
+        """Configured chat ids plus successfully resolved ``title:`` entities.
+
+        This is the authoritative set of chats the application actually watches,
+        derived from the configuration and the entities resolved from Telegram
+        (never from ``DISTINCT chat_id`` over stored messages). Call it after
+        :meth:`start` so title entries have been resolved.
+        """
+        return self._configured_chat_ids()
+
+    @property
+    def history_sync_enabled(self) -> bool:
+        """Whether startup history reconciliation is part of this runner."""
+        return self._history_sync
+
+    @property
+    def history_results(self):
+        """Per-chat results of the last startup history sync (may be empty)."""
+        return self._history_results
+
+    def history_failed_chat_ids(self):
+        """Configured chats whose last startup history sync did not complete.
+
+        A failed/incomplete sync must prevent the bootstrap snapshot for that
+        chat: fixing a watermark over an incomplete history could permanently
+        exclude old messages from analysis.
+        """
+        return frozenset(
+            int(result.chat_id) for result in self._history_results if not result.ok
+        )
 
     @staticmethod
     def _normalize_title(title: str) -> str:
@@ -305,9 +316,8 @@ class TelegramRunner:
             chat_id = int(entity.id)
             resolved[chat_id] = entity
             logger.info(
-                "Resolved configured title %r to forum supergroup chat_id=%s",
+                "Resolved configured title %r to a forum supergroup",
                 title,
-                chat_id,
             )
         return resolved
 
@@ -324,9 +334,8 @@ class TelegramRunner:
                 self._entities_by_chat_id[chat_id] = entity
             except Exception:
                 logger.warning(
-                    "Could not resolve entity for configured chat_id=%s; "
-                    "topic metadata may be unavailable.",
-                    chat_id,
+                    "Could not resolve entity for a configured chat; "
+                    "topic metadata may be unavailable."
                 )
 
     def register(self, handler=None, chat_ids=None) -> None:
@@ -389,9 +398,11 @@ class TelegramRunner:
         logger.info("Telegram client connected and caught up.")
 
         # catch_up() is not a delivery guarantee; reconcile recent history for
-        # each configured chat to close small gaps left while offline.
+        # each configured chat to close small gaps left while offline. Keep the
+        # per-chat outcomes so the startup wiring can avoid snapshotting a chat
+        # whose history sync did not complete.
         if self._history_sync and self._store is not None and self._writer is not None:
-            await self.sync_history()
+            self._history_results = tuple(await self.sync_history())
 
     async def sync_history(self):
         """Run bounded history reconciliation for the configured chats."""
@@ -405,10 +416,18 @@ class TelegramRunner:
             topic_resolver=self._topic_resolver,
         )
 
+    async def wait(self) -> None:
+        """Wait until the client disconnects, without starting it again.
+
+        Split out of :meth:`run_forever` so a caller can run its own post-start
+        work (for example launching the AI worker) before blocking here.
+        """
+        await self._client.run_until_disconnected()
+
     async def run_forever(self) -> None:
         """Register, connect, recover, then wait until disconnected."""
         await self.start()
-        await self._client.run_until_disconnected()
+        await self.wait()
 
     async def shutdown(self) -> None:
         """Stop the pipeline and release resources, in a safe order.

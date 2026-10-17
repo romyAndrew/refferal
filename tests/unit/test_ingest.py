@@ -257,7 +257,9 @@ async def test_writer_logs_persistence_errors_and_keeps_running(caplog):
     assert writer.saved == 0
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 2
-    assert "Failed to store message chat_id=-1001234567890 message_id=1" in caplog.text
+    assert "Failed to store message" in caplog.text
+    assert "chat_id=" not in caplog.text
+    assert "message_id=" not in caplog.text
     # Full text and secrets must never reach the logs.
     assert "SECRET TEXT ONE" not in caplog.text
     assert "SECRET TEXT TWO" not in caplog.text

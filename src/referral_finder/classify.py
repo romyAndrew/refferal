@@ -126,11 +126,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     result = classify(text)
                 except Exception:
                     errors += 1
-                    logger.exception(
-                        "Classification failed chat_id=%s message_id=%s",
-                        chat_id,
-                        message_id,
-                    )
+                    logger.exception("Classification failed for a message")
                     continue
                 categories[result.category] += 1
                 rows.append(
